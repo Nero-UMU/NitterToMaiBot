@@ -45,6 +45,33 @@ class _CommandNitterClient:
 class PluginCommandTests(IsolatedAsyncioTestCase):
     """验证关注命令会写入当前群的独立订阅。"""
 
+    async def test_help_command_sends_chinese_command_list(self) -> None:
+        calls: List[Tuple[str, Dict[str, Any]]] = []
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method
+            del plugin_id
+            del timeout_ms
+            calls.append((str(payload["capability"]), payload))
+            return {"success": True}
+
+        plugin = create_plugin()
+        plugin._set_context(PluginContext("third-party.nitter-to-maibot", rpc_call=rpc_call))
+
+        result = await plugin.handle_help(stream_id="qq-private-stream")
+
+        self.assertTrue(result[0])
+        self.assertEqual(result[2], 2)
+        self.assertIn("/推特关注 <账号1> [账号2 ...]", result[1])
+        self.assertIn("/twitter_help", result[1])
+        self.assertEqual([capability for capability, _payload in calls], ["send.text"])
+        self.assertEqual(calls[0][1]["args"]["text"], result[1])
+
     async def test_auto_parse_supports_private_qq_stream(self) -> None:
         plugin = create_plugin()
         plugin.set_plugin_config(

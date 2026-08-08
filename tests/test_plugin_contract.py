@@ -24,6 +24,7 @@ class PluginContractTests(TestCase):
         components = plugin.get_components()
         component_names = {component["name"] for component in components}
 
+        self.assertIn("nitter_to_maibot_help", component_names)
         self.assertIn("nitter_to_maibot_status", component_names)
         self.assertIn("nitter_to_maibot_scan", component_names)
         self.assertIn("nitter_to_maibot_follow", component_names)
@@ -37,6 +38,10 @@ class PluginContractTests(TestCase):
         posts_component = next(
             component for component in components if component["name"] == "nitter_to_maibot_posts"
         )
+        help_component = next(
+            component for component in components if component["name"] == "nitter_to_maibot_help"
+        )
+        self.assertIn("twitter_help", help_component["metadata"]["command_pattern"])
         self.assertIn("twitter_posts", posts_component["metadata"]["command_pattern"])
         auto_parse_component = next(
             component for component in components if component["name"] == "nitter_to_maibot_auto_parse_status"

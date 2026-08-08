@@ -40,6 +40,25 @@ TRANSLATION_SYSTEM_PROMPT = (
     "保留人名、账号、话题标签、URL、换行和原文语气，不要解释、概括、审查或回答推文内容。"
     "只输出翻译结果，不要添加标题、引号或‘翻译’前缀。"
 )
+HELP_TEXT = """推特命令帮助
+
+订阅管理（仅 QQ 群聊）
+/推特关注 <账号1> [账号2 ...]：订阅账号
+/推特取关 <账号1> [账号2 ...]：取消订阅
+/推特订阅：查看当前群订阅
+/推特推送 开启|关闭：控制当前群推送
+
+推文获取（QQ 群聊或私聊）
+/推特推文 <账号> [数量]：获取最新推文，数量默认为 1
+/推特解析 <推文链接>：解析指定推文
+
+运行维护
+/nitter_status：查看插件状态
+/nitter_scan：立即扫描一次订阅
+
+英文别名
+/twitter_help、/twitter_follow、/twitter_unfollow、/twitter_follows
+/twitter_push、/twitter_posts、/twitter_parse"""
 TranslationModelTask = Literal["utils", "replyer", "planner"]
 
 
@@ -446,6 +465,19 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         else:
             await self._stop_polling()
         self.ctx.logger.info("NitterToMaiBot 配置已更新：version=%s", version)
+
+    @Command(
+        "nitter_to_maibot_help",
+        description="查看 Nitter 推文转发插件的命令帮助",
+        pattern=r"^/(?:推特帮助|twitter_help)$",
+    )
+    async def handle_help(self, stream_id: str = "", **kwargs: Any) -> Tuple[bool, str, int]:
+        """向当前聊天返回全部可用命令及简要说明。"""
+
+        del kwargs
+        if stream_id:
+            await self.ctx.send.text(HELP_TEXT, stream_id)
+        return True, HELP_TEXT, 2
 
     @Command(
         "nitter_to_maibot_status",

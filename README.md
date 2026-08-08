@@ -44,6 +44,8 @@ git clone https://github.com/Nero-UMU/NitterToMaiBot.git
 
 ## 命令
 
+- `/推特帮助`：查看全部可用命令、参数和简要说明。英文别名：`/twitter_help`。
+
 ### 订阅管理命令
 
 以下命令只能在 QQ 群聊中使用：
