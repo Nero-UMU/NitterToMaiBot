@@ -10,11 +10,32 @@ import tomllib
 from maibot_sdk.context import PluginContext, PluginPaths
 
 from plugins.NitterToMaiBot.config_mirror import SubscriptionConfigMirror
-from plugins.NitterToMaiBot.plugin import create_plugin
+from plugins.NitterToMaiBot.plugin import LEGACY_PLUGIN_ID, PLUGIN_ID, create_plugin
 
 
 class PluginMigrationTests(IsolatedAsyncioTestCase):
     """验证旧订阅文件和旧全局配置会在加载时一次性合并。"""
+
+    def test_legacy_id_keeps_using_its_current_data_directory(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            legacy_data_dir = temp_path / LEGACY_PLUGIN_ID
+            legacy_data_dir.mkdir()
+            state_path = legacy_data_dir / "state.json"
+            state_path.write_text("{}", encoding="utf-8")
+            plugin = create_plugin()
+            plugin._set_context(
+                PluginContext(
+                    LEGACY_PLUGIN_ID,
+                    paths=PluginPaths(
+                        data_dir=legacy_data_dir,
+                        runtime_dir=temp_path / "runtime",
+                    ),
+                )
+            )
+
+            self.assertFalse(plugin._migrate_legacy_plugin_id_data())
+            self.assertTrue(state_path.is_file())
 
     async def test_on_load_migrates_all_legacy_subscription_sources(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -53,7 +74,7 @@ class PluginMigrationTests(IsolatedAsyncioTestCase):
             )
             plugin._set_context(
                 PluginContext(
-                    "third-party.nitter-to-maibot",
+                    PLUGIN_ID,
                     paths=PluginPaths(
                         data_dir=data_dir,
                         runtime_dir=temp_path / "runtime",
@@ -76,3 +97,56 @@ class PluginMigrationTests(IsolatedAsyncioTestCase):
             self.assertEqual(mirrored_config["delivery"]["qq_groups"], [])
             self.assertEqual(mirrored_config["subscriptions"]["groups"], subscriptions["groups"])
             self.assertEqual(mirrored_config["subscriptions"]["accounts"], subscriptions["accounts"])
+
+    async def test_on_load_migrates_legacy_plugin_id_data_directory(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            temp_path = Path(temp_dir)
+            plugin_data_root = temp_path / "plugin-data"
+            legacy_data_dir = plugin_data_root / LEGACY_PLUGIN_ID
+            legacy_data_dir.mkdir(parents=True)
+            (legacy_data_dir / "state.json").write_text(
+                json.dumps({"version": 1, "seen": {"OpenAI": ["123"]}, "progress": {}}),
+                encoding="utf-8",
+            )
+            (legacy_data_dir / "subscriptions.json").write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "groups": [{"group_id": "10001", "enabled": True}],
+                        "accounts": [{"account": "OpenAI", "qq_groups": ["10001"]}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            config_path = temp_path / "config.toml"
+            config_path.write_text(
+                "[nitter]\naccounts = []\n\n[delivery]\nqq_groups = []\n",
+                encoding="utf-8",
+            )
+            new_data_dir = plugin_data_root / PLUGIN_ID
+
+            plugin = create_plugin()
+            plugin._config_mirror = SubscriptionConfigMirror(config_path)
+            plugin.set_plugin_config(
+                {"plugin": {"enabled": False, "config_version": "1.5.3"}}
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    paths=PluginPaths(
+                        data_dir=new_data_dir,
+                        runtime_dir=temp_path / "runtime",
+                    ),
+                )
+            )
+
+            await plugin.on_load()
+            targets = plugin._build_scan_targets()
+            state_store = plugin._require_state_store()
+            await plugin.on_unload()
+
+            self.assertFalse(legacy_data_dir.exists())
+            self.assertTrue((new_data_dir / "state.json").is_file())
+            self.assertTrue((new_data_dir / "subscriptions.json").is_file())
+            self.assertEqual(targets, {"OpenAI": ["10001"]})
+            self.assertTrue(state_store.is_seen("OpenAI", "123"))

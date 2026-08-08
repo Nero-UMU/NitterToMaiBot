@@ -29,6 +29,8 @@ git clone https://github.com/Nero-UMU/NitterToMaiBot.git
 
 插件依赖会按照 `_manifest.json` 由 MaiBot 安装，无需手动安装 Python 包。首次加载时，Runner 会根据插件配置模型生成本地 `config.toml`。
 
+插件 ID 为 `github.nero-umu.nitter-to-maibot`；从旧 ID 升级时，插件会自动迁移原有订阅和去重状态。
+
 ### 基本设置
 
 在 MaiBot 后台打开本插件并完成以下设置：
@@ -89,7 +91,6 @@ git clone https://github.com/Nero-UMU/NitterToMaiBot.git
 - `send.text`、`send.image`、`send.custom`：发送推文正文、图片、视频和其他附件。
 - `send.forward`：发送多条推文或较长订阅列表的 QQ 合并转发。
 - `llm.generate`：仅在开启推文翻译后调用所选 MaiBot 模型任务。
-- `config.get`：读取插件运行配置。
 
 插件没有向 LLM 注册 Tool；聊天交互由命令和推文链接拦截处理。
 

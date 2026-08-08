@@ -1,6 +1,7 @@
 {
   "manifest_version": 2,
-  "version": "1.5.5",
+  "id": "github.nero-umu.nitter-to-maibot",
+  "version": "1.5.6",
   "name": "Nitter 推文转发",
   "description": "定期读取 Nitter 订阅账号的新推文，支持按 QQ 群独立订阅，并转发正文、图片和视频附件。",
   "author": {
@@ -10,7 +11,9 @@
   "license": "GPL-3.0-or-later",
   "urls": {
     "repository": "https://github.com/Nero-UMU/NitterToMaiBot",
-    "documentation": "https://github.com/Nero-UMU/NitterToMaiBot#readme"
+    "homepage": "https://github.com/Nero-UMU/NitterToMaiBot",
+    "documentation": "https://github.com/Nero-UMU/NitterToMaiBot/blob/main/README.md",
+    "issues": "https://github.com/Nero-UMU/NitterToMaiBot/issues"
   },
   "changelog": "CHANGELOG.md",
   "host_application": {
@@ -30,7 +33,6 @@
   ],
   "capabilities": [
     "chat.open_session",
-    "config.get",
     "llm.generate",
     "send.custom",
     "send.forward",
@@ -43,8 +45,7 @@
       "zh-CN"
     ]
   },
-  "id": "third-party.nitter-to-maibot",
-  "plugin_type": "extension",
+  "plugin_type": "integration",
   "display": {
     "icon": {
       "type": "lucide",

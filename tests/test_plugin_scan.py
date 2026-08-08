@@ -10,7 +10,7 @@ from unittest.mock import patch
 from maibot_sdk.context import PluginContext, PluginPaths
 
 from plugins.NitterToMaiBot.models import MediaAttachment, NitterPost
-from plugins.NitterToMaiBot.plugin import create_plugin
+from plugins.NitterToMaiBot.plugin import PLUGIN_ID, create_plugin
 from plugins.NitterToMaiBot.tests.helpers import use_temporary_config_mirror
 
 
@@ -170,7 +170,7 @@ class PluginScanTests(IsolatedAsyncioTestCase):
                 },
             }
         )
-        plugin._set_context(PluginContext("third-party.nitter-to-maibot", rpc_call=rpc_call))
+        plugin._set_context(PluginContext(PLUGIN_ID, rpc_call=rpc_call))
         post = NitterPost(
             account="example",
             post_id="123456",
@@ -219,7 +219,7 @@ class PluginScanTests(IsolatedAsyncioTestCase):
                 "translation": {"enabled": True, "model": "planner"},
             }
         )
-        plugin._set_context(PluginContext("third-party.nitter-to-maibot", rpc_call=rpc_call))
+        plugin._set_context(PluginContext(PLUGIN_ID, rpc_call=rpc_call))
 
         with self.assertRaisesRegex(RuntimeError, "测试模型不可用"):
             await plugin._prepare_post_translation(_FakeNitterClient.post)
@@ -263,7 +263,7 @@ class PluginScanTests(IsolatedAsyncioTestCase):
                 }
             )
             context = PluginContext(
-                "third-party.nitter-to-maibot",
+                PLUGIN_ID,
                 rpc_call=rpc_call,
                 paths=PluginPaths(
                     data_dir=Path(temp_dir) / "data",
@@ -331,7 +331,7 @@ class PluginScanTests(IsolatedAsyncioTestCase):
                 }
             )
             context = PluginContext(
-                "third-party.nitter-to-maibot",
+                PLUGIN_ID,
                 rpc_call=rpc_call,
                 paths=PluginPaths(
                     data_dir=Path(temp_dir) / "data",
@@ -398,7 +398,7 @@ class PluginScanTests(IsolatedAsyncioTestCase):
                 }
             )
             context = PluginContext(
-                "third-party.nitter-to-maibot",
+                PLUGIN_ID,
                 rpc_call=rpc_call,
                 paths=PluginPaths(
                     data_dir=Path(temp_dir) / "data",

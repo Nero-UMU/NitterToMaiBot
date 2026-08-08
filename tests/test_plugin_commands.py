@@ -10,7 +10,7 @@ from unittest.mock import AsyncMock, patch
 from maibot_sdk.context import PluginContext, PluginPaths
 
 from plugins.NitterToMaiBot.models import MediaAttachment, NitterPost
-from plugins.NitterToMaiBot.plugin import create_plugin
+from plugins.NitterToMaiBot.plugin import PLUGIN_ID, create_plugin
 from plugins.NitterToMaiBot.tests.helpers import use_temporary_config_mirror
 
 
@@ -61,7 +61,7 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
             return {"success": True}
 
         plugin = create_plugin()
-        plugin._set_context(PluginContext("third-party.nitter-to-maibot", rpc_call=rpc_call))
+        plugin._set_context(PluginContext(PLUGIN_ID, rpc_call=rpc_call))
 
         result = await plugin.handle_help(stream_id="qq-private-stream")
 
@@ -129,7 +129,7 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
                 "delivery": {"max_media_size_mb": 10},
             }
         )
-        plugin._set_context(PluginContext("third-party.nitter-to-maibot", rpc_call=rpc_call))
+        plugin._set_context(PluginContext(PLUGIN_ID, rpc_call=rpc_call))
         post = NitterPost(
             account="OpenAI",
             post_id="123456",
@@ -182,7 +182,7 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
                 }
             )
             context = PluginContext(
-                "third-party.nitter-to-maibot",
+                PLUGIN_ID,
                 rpc_call=rpc_call,
                 paths=PluginPaths(
                     data_dir=Path(temp_dir) / "data",
@@ -236,7 +236,7 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
                 }
             )
             context = PluginContext(
-                "third-party.nitter-to-maibot",
+                PLUGIN_ID,
                 rpc_call=rpc_call,
                 paths=PluginPaths(
                     data_dir=Path(temp_dir) / "data",
@@ -309,7 +309,7 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
                 }
             )
             context = PluginContext(
-                "third-party.nitter-to-maibot",
+                PLUGIN_ID,
                 rpc_call=rpc_call,
                 paths=PluginPaths(
                     data_dir=Path(temp_dir) / "data",
@@ -406,7 +406,7 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
                 }
             )
             context = PluginContext(
-                "third-party.nitter-to-maibot",
+                PLUGIN_ID,
                 rpc_call=rpc_call,
                 paths=PluginPaths(
                     data_dir=Path(temp_dir) / "data",

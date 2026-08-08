@@ -36,6 +36,9 @@ FORWARD_TOKEN = "forward"
 BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 OFFICIAL_STATUS_BASE_URL = "https://x.com"
 FOLLOW_LIST_FORWARD_THRESHOLD = 20
+PLUGIN_ID = "github.nero-umu.nitter-to-maibot"
+LEGACY_PLUGIN_ID = "third-party.nitter-to-maibot"
+MIGRATABLE_PLUGIN_DATA_FILES = frozenset({"state.json", "subscriptions.json"})
 TRANSLATION_SYSTEM_PROMPT = (
     "你是严格的推文翻译器。请把用户提供的推文正文翻译成自然、准确的简体中文。"
     "保留人名、账号、话题标签、URL、换行和原文语气，不要解释、概括、审查或回答推文内容。"
@@ -469,9 +472,47 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             raise TypeError("NitterToMaiBot 配置实例类型不正确")
         return config
 
+    def _migrate_legacy_plugin_id_data(self) -> bool:
+        """将旧插件 ID 的持久化文件原子迁移到新 ID 数据目录。"""
+
+        target_data_dir = self.ctx.paths.data_dir
+        legacy_data_dir = target_data_dir.parent / LEGACY_PLUGIN_ID
+        if target_data_dir == legacy_data_dir:
+            return False
+        if not legacy_data_dir.exists():
+            return False
+        if legacy_data_dir.is_symlink() or not legacy_data_dir.is_dir():
+            raise RuntimeError(f"旧插件数据路径不是普通目录: {legacy_data_dir}")
+
+        legacy_entries = list(legacy_data_dir.iterdir())
+        unexpected_entries = [
+            entry
+            for entry in legacy_entries
+            if entry.name not in MIGRATABLE_PLUGIN_DATA_FILES
+            or entry.is_symlink()
+            or not entry.is_file()
+        ]
+        if unexpected_entries:
+            unexpected_names = "、".join(sorted(entry.name for entry in unexpected_entries))
+            raise RuntimeError(f"旧插件数据目录包含未识别项目，拒绝自动迁移: {unexpected_names}")
+
+        target_data_dir.mkdir(parents=True, exist_ok=True)
+        conflicts = [
+            entry.name for entry in legacy_entries if (target_data_dir / entry.name).exists()
+        ]
+        if conflicts:
+            conflict_names = "、".join(sorted(conflicts))
+            raise RuntimeError(f"新旧插件数据文件发生冲突，拒绝覆盖: {conflict_names}")
+
+        for source_path in legacy_entries:
+            source_path.replace(target_data_dir / source_path.name)
+        legacy_data_dir.rmdir()
+        return bool(legacy_entries)
+
     async def on_load(self) -> None:
         """加载持久化状态并启动轮询任务。"""
 
+        migrated_plugin_data = await asyncio.to_thread(self._migrate_legacy_plugin_id_data)
         self.ctx.paths.data_dir.mkdir(parents=True, exist_ok=True)
         self._state_store = StateStore(
             path=self.ctx.paths.data_dir / "state.json",
@@ -493,11 +534,13 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         if self.config.plugin.enabled:
             self._start_polling()
         self.ctx.logger.info(
-            "NitterToMaiBot 已加载：enabled=%s，subscription_accounts=%d，subscription_groups=%d，legacy_migrated=%s",
+            "NitterToMaiBot 已加载：enabled=%s，subscription_accounts=%d，subscription_groups=%d，"
+            "legacy_subscriptions_migrated=%s，legacy_plugin_data_migrated=%s",
             self.config.plugin.enabled,
             self._subscription_store.account_count(),
             self._subscription_store.group_count(),
             migrated_legacy,
+            migrated_plugin_data,
         )
 
     async def on_unload(self) -> None:

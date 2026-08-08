@@ -9,6 +9,7 @@ from plugins.NitterToMaiBot.plugin import (
     DeliverySectionConfig,
     NitterSectionConfig,
     NitterToMaiBotConfig,
+    PLUGIN_ID,
     QuietHoursSectionConfig,
     TRANSLATION_SYSTEM_PROMPT,
     TranslationSectionConfig,
@@ -87,6 +88,13 @@ class PluginContractTests(TestCase):
 
         self.assertIn("send.forward", manifest["capabilities"])
         self.assertIn("llm.generate", manifest["capabilities"])
+        self.assertNotIn("config.get", manifest["capabilities"])
+        self.assertEqual(manifest["id"], PLUGIN_ID)
+        self.assertEqual(manifest["plugin_type"], "integration")
+        self.assertEqual(
+            manifest["urls"]["issues"],
+            "https://github.com/Nero-UMU/NitterToMaiBot/issues",
+        )
 
     def test_project_uses_gpl_3_or_later(self) -> None:
         project_dir = Path(__file__).parents[1]
