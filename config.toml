@@ -1,6 +1,6 @@
 [plugin]
 enabled = false
-config_version = "1.5.1"
+config_version = "1.5.3"
 
 [nitter]
 base_url = "https://nitter.net"
@@ -27,6 +27,11 @@ send_videos = true
 send_other_files = true
 forward_batch_threshold = 1
 max_media_size_mb = 10
+
+[quiet_hours]
+enabled = false
+start_time = "00:00"
+end_time = "06:00"
 
 [interaction]
 allow_group_commands = true

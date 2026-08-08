@@ -1,6 +1,7 @@
 """定期把 Nitter 订阅账号的新推文转发到指定 QQ 群。"""
 
 from dataclasses import replace
+from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
@@ -14,7 +15,7 @@ import re
 
 from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase
 from maibot_sdk.types import HookMode
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 
 from .config_mirror import SubscriptionConfigMirror
 from .models import MediaAttachment, NitterPost, ScanSummary
@@ -75,7 +76,7 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "启用插件", "hint": "开启后插件会按照下方轮询设置检查订阅账号。"},
     )
     config_version: str = Field(
-        default="1.5.1",
+        default="1.5.3",
         description="用于插件自动升级配置结构，由程序维护。",
         json_schema_extra={"disabled": True, "label": "配置版本", "hint": "只读字段，请勿手动修改。"},
     )
@@ -299,6 +300,63 @@ class DeliverySectionConfig(PluginConfigBase):
         return normalized_value
 
 
+class QuietHoursSectionConfig(PluginConfigBase):
+    """自动订阅推送的静默时段配置。"""
+
+    __ui_label__ = "静默时段"
+    __ui_icon__ = "moon"
+    __ui_order__ = 4
+
+    enabled: bool = Field(
+        default=False,
+        description="是否在指定的北京时间范围内暂停自动订阅推送。",
+        json_schema_extra={
+            "label": "启用静默时段",
+            "hint": "默认关闭；静默期间的新推文会暂存，结束后一次性合并转发。",
+        },
+    )
+    start_time: str = Field(
+        default="00:00",
+        description="每天开始暂停自动订阅推送的北京时间。",
+        json_schema_extra={
+            "label": "静默开始时间",
+            "hint": "使用 24 小时制 HH:MM，例如 00:00。允许跨越午夜。",
+            "placeholder": "00:00",
+        },
+    )
+    end_time: str = Field(
+        default="06:00",
+        description="每天恢复自动订阅推送的北京时间。",
+        json_schema_extra={
+            "label": "静默结束时间",
+            "hint": "使用 24 小时制 HH:MM，例如 06:00；到达该时间后的下一轮扫描会发送积压。",
+            "placeholder": "06:00",
+        },
+    )
+
+    @field_validator("start_time", "end_time")
+    @classmethod
+    def validate_clock_time(cls, value: str) -> str:
+        """校验并统一为 HH:MM 格式。"""
+
+        match = re.fullmatch(r"(?P<hour>\d{1,2}):(?P<minute>\d{2})", value.strip())
+        if match is None:
+            raise ValueError("静默时间必须使用 24 小时制 HH:MM 格式")
+        hour = int(match.group("hour"))
+        minute = int(match.group("minute"))
+        if hour > 23 or minute > 59:
+            raise ValueError("静默时间必须是有效的 24 小时时间")
+        return f"{hour:02d}:{minute:02d}"
+
+    @model_validator(mode="after")
+    def validate_time_range(self) -> "QuietHoursSectionConfig":
+        """起止相同无法表达明确的静默范围。"""
+
+        if self.start_time == self.end_time:
+            raise ValueError("静默开始时间和结束时间不能相同")
+        return self
+
+
 class InteractionSectionConfig(PluginConfigBase):
     """群内订阅命令与推文链接解析配置。"""
 
@@ -382,6 +440,7 @@ class NitterToMaiBotConfig(PluginConfigBase):
     nitter: NitterSectionConfig = Field(default_factory=NitterSectionConfig)
     translation: TranslationSectionConfig = Field(default_factory=TranslationSectionConfig)
     delivery: DeliverySectionConfig = Field(default_factory=DeliverySectionConfig)
+    quiet_hours: QuietHoursSectionConfig = Field(default_factory=QuietHoursSectionConfig)
     interaction: InteractionSectionConfig = Field(default_factory=InteractionSectionConfig)
     subscriptions: SubscriptionViewSectionConfig = Field(default_factory=SubscriptionViewSectionConfig)
 
@@ -494,6 +553,15 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             if self.config.translation.enabled
             else "关闭"
         )
+        quiet_post_count = self._require_state_store().quiet_post_count()
+        quiet_hours_status = f"关闭（待发送 {quiet_post_count} 条）"
+        if self.config.quiet_hours.enabled:
+            current_phase = "当前静默" if self._is_quiet_period() else "当前可发送"
+            quiet_hours_status = (
+                f"{self.config.quiet_hours.start_time}–{self.config.quiet_hours.end_time}"
+                f"（北京时间，{current_phase}，待发送 "
+                f"{quiet_post_count} 条）"
+            )
         status_text = (
             "NitterToMaiBot 状态\n"
             f"启用：{'是' if self.config.plugin.enabled else '否'}\n"
@@ -501,6 +569,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             f"订阅账号：{subscription_store.account_count()} 个\n"
             f"订阅 QQ 群：{subscription_store.group_count()} 个\n"
             f"推文翻译：{translation_status}\n"
+            f"静默时段：{quiet_hours_status}\n"
             f"图片下载上限：{self.config.delivery.max_media_size_mb} MiB\n"
             f"合并转发阈值：超过 {self.config.delivery.forward_batch_threshold} 条\n"
             f"轮询间隔：{self.config.nitter.poll_interval_seconds} 秒"
@@ -530,6 +599,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             f"账号 {summary.scanned_accounts} 个，"
             f"读取推文 {summary.fetched_posts} 条，"
             f"完成转发 {summary.forwarded_posts} 条，"
+            f"静默待发送 {summary.deferred_posts} 条，"
             f"失败账号 {summary.failed_accounts} 个。"
         )
         if stream_id:
@@ -1280,21 +1350,74 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         finally:
             self._wake_event.clear()
 
+    def _is_quiet_period(self, now: Optional[datetime] = None) -> bool:
+        """按北京时间判断当前是否处于配置的静默范围。"""
+
+        if not self.config.quiet_hours.enabled:
+            return False
+        current_time = now or datetime.now(BEIJING_TIMEZONE)
+        if current_time.tzinfo is None:
+            raise ValueError("静默时段判断需要带时区的时间")
+        beijing_time = current_time.astimezone(BEIJING_TIMEZONE)
+        current_minutes = beijing_time.hour * 60 + beijing_time.minute
+        start_minutes = self._clock_time_to_minutes(self.config.quiet_hours.start_time)
+        end_minutes = self._clock_time_to_minutes(self.config.quiet_hours.end_time)
+        if start_minutes < end_minutes:
+            return start_minutes <= current_minutes < end_minutes
+        return current_minutes >= start_minutes or current_minutes < end_minutes
+
+    @staticmethod
+    def _clock_time_to_minutes(value: str) -> int:
+        """把已经校验的 HH:MM 配置转换为当天分钟数。"""
+
+        hour_text, minute_text = value.split(":", maxsplit=1)
+        return int(hour_text) * 60 + int(minute_text)
+
     async def _scan_once(self) -> ScanSummary:
         """扫描全部订阅账号，并按目标群聚合同一轮的新推文。"""
 
         async with self._scan_lock:
             summary = ScanSummary()
+            state_store = self._require_state_store()
             scan_targets = self._build_scan_targets()
             if not scan_targets:
                 self.ctx.logger.warning("没有已启用的群订阅，本轮扫描跳过")
+                summary.deferred_posts = state_store.quiet_post_count()
                 return summary
 
             client = self._create_client()
             stream_cache: Dict[str, str] = {}
-            state_store = self._require_state_store()
             pending_deliveries: Dict[Tuple[str, str], Tuple[NitterPost, List[str]]] = {}
             fetched_profile_names: Dict[str, str] = {}
+            quiet_active = self._is_quiet_period()
+            quiet_post_keys = {
+                (post.account, post.post_id) for post in state_store.quiet_posts()
+            }
+
+            if not quiet_active:
+                targets_by_account = {
+                    account.lower(): qq_groups for account, qq_groups in scan_targets.items()
+                }
+                queue_changed = False
+                for queued_post in state_store.quiet_posts():
+                    qq_groups = targets_by_account.get(queued_post.account.lower())
+                    if qq_groups is None or (
+                        queued_post.is_retweet and not self.config.nitter.include_retweets
+                    ):
+                        state_store.mark_seen(queued_post.account, queued_post.post_id)
+                        queue_changed = True
+                        self.ctx.logger.info(
+                            "已移除不再需要投递的静默积压 @%s/%s",
+                            queued_post.account,
+                            queued_post.post_id,
+                        )
+                        continue
+                    pending_deliveries[(queued_post.account, queued_post.post_id)] = (
+                        queued_post,
+                        qq_groups,
+                    )
+                if queue_changed:
+                    await asyncio.to_thread(state_store.save)
 
             for account, qq_groups in scan_targets.items():
                 summary.scanned_accounts += 1
@@ -1318,7 +1441,12 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                     state_store.mark_baseline(account, [])
                     await asyncio.to_thread(state_store.save)
 
-                pending_posts = [post for post in posts if not state_store.is_seen(account, post.post_id)]
+                pending_posts = [
+                    post
+                    for post in posts
+                    if not state_store.is_seen(account, post.post_id)
+                    and not state_store.is_quiet_queued(account, post.post_id)
+                ]
                 batch_size = self.config.nitter.max_posts_per_scan
                 batch = list(reversed(pending_posts[-batch_size:]))
                 for post in batch:
@@ -1341,12 +1469,24 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                             exc_info=True,
                         )
                         continue
-                    pending_deliveries[(prepared_post.account, prepared_post.post_id)] = (
-                        prepared_post,
-                        qq_groups,
-                    )
+                    if quiet_active:
+                        state_store.queue_quiet_post(prepared_post)
+                    else:
+                        pending_deliveries[(prepared_post.account, prepared_post.post_id)] = (
+                            prepared_post,
+                            qq_groups,
+                        )
 
             await self._update_subscription_display_names(fetched_profile_names)
+
+            if quiet_active:
+                await asyncio.to_thread(state_store.save)
+                summary.deferred_posts = state_store.quiet_post_count()
+                self.ctx.logger.info(
+                    "当前处于静默时段，本轮未转发；累计待发送 %d 条推文",
+                    summary.deferred_posts,
+                )
+                return summary
 
             posts_by_group: Dict[str, List[NitterPost]] = {}
             for post, qq_groups in pending_deliveries.values():
@@ -1375,7 +1515,14 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                     if not state_store.completed_tokens(post.account, post.post_id, group_id)
                 ]
                 individual_posts = incomplete_posts
-                if len(clean_posts) > self.config.delivery.forward_batch_threshold:
+                contains_quiet_backlog = any(
+                    (post.account, post.post_id) in quiet_post_keys for post in clean_posts
+                )
+                should_batch = (
+                    len(clean_posts) > self.config.delivery.forward_batch_threshold
+                    or (contains_quiet_backlog and len(clean_posts) > 1)
+                )
+                if should_batch:
                     individual_posts = [post for post in incomplete_posts if post not in clean_posts]
                     try:
                         forward_sent = await self._send_posts_forward(
@@ -1415,6 +1562,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 summary.forwarded_posts += 1
                 self.ctx.logger.info("已转发 @%s 的推文 %s", post.account, post.post_id)
 
+            summary.deferred_posts = state_store.quiet_post_count()
             return summary
 
     async def _deliver_post_to_group(

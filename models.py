@@ -37,4 +37,5 @@ class ScanSummary:
     scanned_accounts: int = 0
     fetched_posts: int = 0
     forwarded_posts: int = 0
+    deferred_posts: int = 0
     failed_accounts: int = 0

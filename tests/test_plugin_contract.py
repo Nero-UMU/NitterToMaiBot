@@ -10,6 +10,7 @@ from plugins.NitterToMaiBot.plugin import (
     DeliverySectionConfig,
     NitterSectionConfig,
     NitterToMaiBotConfig,
+    QuietHoursSectionConfig,
     TRANSLATION_SYSTEM_PROMPT,
     TranslationSectionConfig,
     create_plugin,
@@ -69,6 +70,17 @@ class PluginContractTests(TestCase):
         self.assertEqual(config.model, "utils")
         self.assertEqual(config.prompt, TRANSLATION_SYSTEM_PROMPT)
 
+    def test_quiet_hours_defaults_and_validation(self) -> None:
+        config = QuietHoursSectionConfig(start_time="0:00", end_time="6:00")
+
+        self.assertFalse(config.enabled)
+        self.assertEqual(config.start_time, "00:00")
+        self.assertEqual(config.end_time, "06:00")
+        with self.assertRaises(ValueError):
+            QuietHoursSectionConfig(start_time="24:00")
+        with self.assertRaises(ValueError):
+            QuietHoursSectionConfig(start_time="06:00", end_time="06:00")
+
     def test_manifest_declares_forward_capability(self) -> None:
         manifest_path = Path(__file__).parents[1] / "_manifest.json"
         with manifest_path.open("r", encoding="utf-8") as manifest_file:
@@ -86,11 +98,14 @@ class PluginContractTests(TestCase):
         self.assertEqual(config.nitter.base_url, "https://nitter.net")
         self.assertEqual(config.nitter.poll_interval_seconds, 600)
         self.assertEqual(config.delivery.forward_batch_threshold, 1)
-        self.assertEqual(config.plugin.config_version, "1.5.1")
+        self.assertEqual(config.plugin.config_version, "1.5.3")
         self.assertFalse(config.translation.enabled)
         self.assertEqual(config.translation.model, "utils")
         self.assertEqual(config.translation.prompt, TRANSLATION_SYSTEM_PROMPT)
         self.assertEqual(config.delivery.max_media_size_mb, 10)
+        self.assertFalse(config.quiet_hours.enabled)
+        self.assertEqual(config.quiet_hours.start_time, "00:00")
+        self.assertEqual(config.quiet_hours.end_time, "06:00")
         self.assertEqual(config.interaction.max_accounts_per_group, 0)
         self.assertTrue(config.interaction.auto_parse_tweet_links)
 
@@ -134,3 +149,7 @@ class PluginContractTests(TestCase):
         self.assertEqual(translation_fields["prompt"]["label"], "翻译提示词")
         self.assertEqual(translation_fields["prompt"]["default"], TRANSLATION_SYSTEM_PROMPT)
         self.assertEqual(translation_fields["prompt"]["ui_type"], "textarea")
+        quiet_fields = schema["sections"]["quiet_hours"]["fields"]
+        self.assertEqual(quiet_fields["enabled"]["label"], "启用静默时段")
+        self.assertEqual(quiet_fields["start_time"]["default"], "00:00")
+        self.assertEqual(quiet_fields["end_time"]["default"], "06:00")

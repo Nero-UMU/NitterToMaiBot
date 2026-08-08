@@ -115,6 +115,29 @@ class PluginScanTests(IsolatedAsyncioTestCase):
 
         self.assertTrue(message_text.startswith("@elonmusk 转推了 @OpenAI · 2026-08-08 12:04（北京时间）"))
 
+    def test_quiet_period_uses_beijing_time_and_supports_cross_midnight(self) -> None:
+        plugin = create_plugin()
+        plugin.set_plugin_config(
+            {
+                "plugin": {"enabled": False, "config_version": "1.5.3"},
+                "quiet_hours": {
+                    "enabled": True,
+                    "start_time": "23:30",
+                    "end_time": "06:00",
+                }
+            }
+        )
+
+        self.assertTrue(
+            plugin._is_quiet_period(datetime(2026, 8, 8, 16, 0, tzinfo=timezone.utc))
+        )
+        self.assertTrue(
+            plugin._is_quiet_period(datetime(2026, 8, 8, 21, 59, tzinfo=timezone.utc))
+        )
+        self.assertFalse(
+            plugin._is_quiet_period(datetime(2026, 8, 8, 22, 0, tzinfo=timezone.utc))
+        )
+
     async def test_translation_uses_selected_maibot_model_task(self) -> None:
         """开启翻译后应调用 SDK LLM 能力，并把中文结果附到原文下方。"""
 
@@ -324,6 +347,83 @@ class PluginScanTests(IsolatedAsyncioTestCase):
             await plugin.on_unload()
 
         self.assertEqual(summary.forwarded_posts, 2)
+        self.assertEqual(
+            [payload["capability"] for _method, payload in calls],
+            ["chat.open_session", "send.forward"],
+        )
+        forward_messages = calls[1][1]["args"]["messages"]
+        self.assertEqual([node["nickname"] for node in forward_messages], ["@first", "@second"])
+
+    async def test_quiet_posts_are_persisted_then_sent_as_one_forward(self) -> None:
+        """静默期间不发送，结束后的下一轮把多条积压合并为一条聊天记录。"""
+
+        calls: List[Tuple[str, Dict[str, Any]]] = []
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del plugin_id
+            del timeout_ms
+            calls.append((method, payload))
+            capability = str(payload["capability"])
+            if capability == "chat.open_session":
+                return {"success": True, "stream_id": "qq-group-stream"}
+            if capability == "send.forward":
+                return {"success": True}
+            raise AssertionError(f"收到未预期的能力调用: {capability}")
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {
+                    "plugin": {"enabled": False, "config_version": "1.5.3"},
+                    "nitter": {
+                        "base_url": "http://127.0.0.1:8080",
+                        "accounts": ["first", "second"],
+                        "send_existing_on_first_run": True,
+                    },
+                    "delivery": {
+                        "qq_groups": ["10001"],
+                        "forward_batch_threshold": 50,
+                    },
+                    "quiet_hours": {
+                        "enabled": True,
+                        "start_time": "00:00",
+                        "end_time": "06:00",
+                    },
+                }
+            )
+            context = PluginContext(
+                "third-party.nitter-to-maibot",
+                rpc_call=rpc_call,
+                paths=PluginPaths(
+                    data_dir=Path(temp_dir) / "data",
+                    runtime_dir=Path(temp_dir) / "runtime",
+                ),
+            )
+            plugin._set_context(context)
+            await plugin.on_load()
+
+            with (
+                patch("plugins.NitterToMaiBot.plugin.NitterClient", _MultiAccountNitterClient),
+                patch.object(plugin, "_is_quiet_period", side_effect=[True, False]),
+            ):
+                quiet_summary = await plugin._scan_once()
+                self.assertEqual(calls, [])
+                self.assertEqual(quiet_summary.forwarded_posts, 0)
+                self.assertEqual(quiet_summary.deferred_posts, 2)
+                self.assertEqual(plugin._require_state_store().quiet_post_count(), 2)
+
+                sent_summary = await plugin._scan_once()
+
+            await plugin.on_unload()
+
+        self.assertEqual(sent_summary.forwarded_posts, 2)
+        self.assertEqual(sent_summary.deferred_posts, 0)
         self.assertEqual(
             [payload["capability"] for _method, payload in calls],
             ["chat.open_session", "send.forward"],
