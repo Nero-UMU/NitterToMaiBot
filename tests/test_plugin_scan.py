@@ -197,8 +197,8 @@ class PluginScanTests(IsolatedAsyncioTestCase):
         )
         self.assertEqual(args["prompt"][1], {"role": "user", "content": "This is a test post."})
 
-    async def test_translation_failure_uses_original_post(self) -> None:
-        """模型返回失败时应直接使用原文，不阻断后续投递。"""
+    async def test_translation_failure_marks_error(self) -> None:
+        """模型返回失败时应标记翻译错误，不阻断后续投递。"""
 
         async def rpc_call(
             method: str,
@@ -223,11 +223,13 @@ class PluginScanTests(IsolatedAsyncioTestCase):
 
         prepared_post = await plugin._prepare_post_translation(_FakeNitterClient.post)
 
-        self.assertIs(prepared_post, _FakeNitterClient.post)
-        self.assertEqual(prepared_post.translated_text, "")
+        message_text = plugin._format_post_text(prepared_post)
+        self.assertIsNot(prepared_post, _FakeNitterClient.post)
+        self.assertEqual(prepared_post.translated_text, "翻译错误")
+        self.assertIn("中文翻译：\n翻译错误", message_text)
 
-    async def test_translation_exception_uses_original_post(self) -> None:
-        """模型 RPC 超时时应直接使用原文，不阻断后续投递。"""
+    async def test_translation_exception_marks_error(self) -> None:
+        """模型 RPC 超时时应标记翻译错误，不阻断后续投递。"""
 
         async def rpc_call(
             method: str,
@@ -252,8 +254,10 @@ class PluginScanTests(IsolatedAsyncioTestCase):
 
         prepared_post = await plugin._prepare_post_translation(_FakeNitterClient.post)
 
-        self.assertIs(prepared_post, _FakeNitterClient.post)
-        self.assertEqual(prepared_post.translated_text, "")
+        message_text = plugin._format_post_text(prepared_post)
+        self.assertIsNot(prepared_post, _FakeNitterClient.post)
+        self.assertEqual(prepared_post.translated_text, "翻译错误")
+        self.assertIn("中文翻译：\n翻译错误", message_text)
 
     async def test_first_scan_can_forward_existing_post(self) -> None:
         calls: List[Tuple[str, Dict[str, Any]]] = []

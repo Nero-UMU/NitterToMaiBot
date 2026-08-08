@@ -1217,11 +1217,11 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 raise RuntimeError("模型返回了空内容")
         except Exception as exc:
             self.ctx.logger.warning(
-                "推文 %s 翻译失败，将直接发送原文：%s",
+                "推文 %s 翻译失败，将在翻译区域显示错误提示：%s",
                 post.post_id,
                 exc,
             )
-            return post
+            return replace(post, translated_text="翻译错误")
         if translated_text == source_text:
             return post
         return replace(post, translated_text=translated_text)
