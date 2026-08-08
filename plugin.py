@@ -17,7 +17,6 @@ from maibot_sdk.types import HookMode
 from pydantic import field_validator
 
 from .config_mirror import SubscriptionConfigMirror
-from .media_cache import CachedMedia, MediaCacheLimitError, MediaCacheService, seconds_until_cleanup
 from .models import MediaAttachment, NitterPost, ScanSummary
 from .nitter_client import MediaTooLargeError, NitterClient
 from .state_store import StateStore
@@ -34,7 +33,6 @@ ACCOUNT_SEPARATOR_PATTERN = re.compile(r"[\s,，]+")
 MESSAGE_TOKEN = "message"
 FORWARD_TOKEN = "forward"
 BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
-MAX_INLINE_MEDIA_BYTES = 10 * 1024 * 1024
 OFFICIAL_STATUS_BASE_URL = "https://x.com"
 FOLLOW_LIST_FORWARD_THRESHOLD = 20
 TRANSLATION_SYSTEM_PROMPT = (
@@ -58,7 +56,7 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "启用插件", "hint": "开启后插件会按照下方轮询设置检查订阅账号。"},
     )
     config_version: str = Field(
-        default="1.6.0",
+        default="1.5.1",
         description="用于插件自动升级配置结构，由程序维护。",
         json_schema_extra={"disabled": True, "label": "配置版本", "hint": "只读字段，请勿手动修改。"},
     )
@@ -232,7 +230,7 @@ class DeliverySectionConfig(PluginConfigBase):
     send_videos: bool = Field(
         default=True,
         description="是否解析推文视频地址，并以 QQ 文件消息发送。",
-        json_schema_extra={"label": "发送视频", "hint": "视频会先下载到插件缓存，再通过临时文件地址发送。"},
+        json_schema_extra={"label": "发送视频", "hint": "视频使用 Nitter 提供的媒体地址作为 QQ 文件发送。"},
     )
     send_other_files: bool = Field(
         default=True,
@@ -247,13 +245,13 @@ class DeliverySectionConfig(PluginConfigBase):
         json_schema_extra={"label": "合并转发阈值", "hint": "默认 1，表示 1 条普通发送，2 条及以上打包。"},
     )
     max_media_size_mb: int = Field(
-        default=100,
+        default=10,
         ge=1,
-        le=1024,
-        description="单个图片、视频或其他附件允许下载到插件缓存的最大大小。",
+        le=100,
+        description="单张推文图片允许下载并内嵌发送的最大大小。",
         json_schema_extra={
             "label": "媒体大小上限（MiB）",
-            "hint": "默认 100 MiB，最大 1024 MiB；图片超过 10 MiB 时仍会作为文件发送。",
+            "hint": "默认 10 MiB；该限制只作用于需要下载后发送的图片。",
         },
     )
 
@@ -280,98 +278,6 @@ class DeliverySectionConfig(PluginConfigBase):
         if normalized_value and not QQ_ID_PATTERN.fullmatch(normalized_value):
             raise ValueError("机器人 QQ 号只能包含数字")
         return normalized_value
-
-
-class MediaCacheSectionConfig(PluginConfigBase):
-    """媒体落盘、临时访问地址与自动清理配置。"""
-
-    __ui_label__ = "媒体缓存"
-    __ui_icon__ = "hard-drive-download"
-    __ui_order__ = 4
-
-    bind_host: str = Field(
-        default="127.0.0.1",
-        description="插件临时文件服务在服务器上监听的网络地址。",
-        json_schema_extra={
-            "label": "媒体服务监听地址",
-            "hint": "QQ 适配器与 MaiBot 同机时保持 127.0.0.1；跨主机使用时需要按网络环境配置。",
-            "placeholder": "127.0.0.1",
-        },
-    )
-    port: int = Field(
-        default=18080,
-        ge=1024,
-        le=65535,
-        description="插件临时文件 HTTP 服务使用的端口。",
-        json_schema_extra={
-            "label": "媒体服务端口",
-            "hint": "默认 18080；必须确保没有被其他程序占用。",
-        },
-    )
-    public_base_url: str = Field(
-        default="http://127.0.0.1:18080",
-        description="发送给 QQ 适配器、用于下载缓存媒体的 HTTP 根地址。",
-        json_schema_extra={
-            "label": "媒体外部访问地址",
-            "hint": "QQ 适配器与 MaiBot 同机时保持默认值；该地址不能包含路径、查询参数或片段。",
-            "placeholder": "http://127.0.0.1:18080",
-        },
-    )
-    cleanup_enabled: bool = Field(
-        default=True,
-        description="是否每天定时删除已经下载到插件数据目录的媒体缓存。",
-        json_schema_extra={
-            "label": "定期清理下载文件",
-            "hint": "默认开启；关闭后媒体文件会持续保留并占用磁盘空间。",
-        },
-    )
-    cleanup_time: str = Field(
-        default="02:00",
-        description="每天执行媒体缓存清理的北京时间，格式为 HH:MM。",
-        json_schema_extra={
-            "label": "每日清理时间",
-            "hint": "默认每天北京时间凌晨 2 点清理全部已下载媒体。",
-            "placeholder": "02:00",
-        },
-    )
-
-    @field_validator("bind_host")
-    @classmethod
-    def validate_bind_host(cls, value: str) -> str:
-        """拒绝空监听地址和包含空白的主机名。"""
-
-        normalized_value = value.strip()
-        if not normalized_value or re.search(r"\s", normalized_value):
-            raise ValueError("媒体服务监听地址不能为空或包含空白")
-        return normalized_value
-
-    @field_validator("public_base_url")
-    @classmethod
-    def validate_public_base_url(cls, value: str) -> str:
-        """要求媒体外部地址是没有附加路径的完整 HTTP(S) 根地址。"""
-
-        normalized_value = value.strip().rstrip("/")
-        parsed_url = urlsplit(normalized_value)
-        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
-            raise ValueError("媒体外部访问地址必须是完整的 http:// 或 https:// URL")
-        if parsed_url.path or parsed_url.query or parsed_url.fragment:
-            raise ValueError("媒体外部访问地址不能包含路径、查询参数或片段")
-        return normalized_value
-
-    @field_validator("cleanup_time")
-    @classmethod
-    def validate_cleanup_time(cls, value: str) -> str:
-        """校验并规范化每日清理时间。"""
-
-        normalized_value = value.strip()
-        match = re.fullmatch(r"(?P<hour>\d{1,2}):(?P<minute>\d{2})", normalized_value)
-        if match is None:
-            raise ValueError("每日清理时间必须使用 HH:MM 格式")
-        hour = int(match.group("hour"))
-        minute = int(match.group("minute"))
-        if hour > 23 or minute > 59:
-            raise ValueError("每日清理时间必须是有效的 24 小时时间")
-        return f"{hour:02d}:{minute:02d}"
 
 
 class InteractionSectionConfig(PluginConfigBase):
@@ -457,7 +363,6 @@ class NitterToMaiBotConfig(PluginConfigBase):
     nitter: NitterSectionConfig = Field(default_factory=NitterSectionConfig)
     translation: TranslationSectionConfig = Field(default_factory=TranslationSectionConfig)
     delivery: DeliverySectionConfig = Field(default_factory=DeliverySectionConfig)
-    media_cache: MediaCacheSectionConfig = Field(default_factory=MediaCacheSectionConfig)
     interaction: InteractionSectionConfig = Field(default_factory=InteractionSectionConfig)
     subscriptions: SubscriptionViewSectionConfig = Field(default_factory=SubscriptionViewSectionConfig)
 
@@ -475,8 +380,6 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         self._subscription_lock = asyncio.Lock()
         self._state_store: Optional[StateStore] = None
         self._subscription_store: Optional[SubscriptionStore] = None
-        self._media_cache_service: Optional[MediaCacheService] = None
-        self._media_cleanup_task: Optional[asyncio.Task[None]] = None
         self._config_mirror = SubscriptionConfigMirror(Path(__file__).resolve().with_name("config.toml"))
 
     @property
@@ -492,7 +395,6 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         """加载持久化状态并启动轮询任务。"""
 
         self.ctx.paths.data_dir.mkdir(parents=True, exist_ok=True)
-        await self._start_media_services()
         self._state_store = StateStore(
             path=self.ctx.paths.data_dir / "state.json",
             max_seen_per_account=self.config.nitter.max_seen_posts_per_account,
@@ -524,7 +426,6 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         """停止后台轮询任务。"""
 
         await self._stop_polling()
-        await self._stop_media_services()
         self.ctx.logger.info("NitterToMaiBot 已卸载")
 
     async def on_config_update(self, scope: str, config_data: Dict[str, object], version: str) -> None:
@@ -540,13 +441,10 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         if self._state_store is not None:
             self._state_store.max_seen_per_account = self.config.nitter.max_seen_posts_per_account
         if self.config.plugin.enabled:
-            async with self._scan_lock:
-                await self._restart_media_services()
             self._start_polling()
             self._wake_event.set()
         else:
             await self._stop_polling()
-            await self._stop_media_services()
         self.ctx.logger.info("NitterToMaiBot 配置已更新：version=%s", version)
 
     @Command(
@@ -564,11 +462,6 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             if self.config.translation.enabled
             else "关闭"
         )
-        cleanup_status = (
-            f"每天 {self.config.media_cache.cleanup_time}（北京时间）"
-            if self.config.media_cache.cleanup_enabled
-            else "关闭"
-        )
         status_text = (
             "NitterToMaiBot 状态\n"
             f"启用：{'是' if self.config.plugin.enabled else '否'}\n"
@@ -576,8 +469,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             f"订阅账号：{subscription_store.account_count()} 个\n"
             f"订阅 QQ 群：{subscription_store.group_count()} 个\n"
             f"推文翻译：{translation_status}\n"
-            f"媒体下载上限：{self.config.delivery.max_media_size_mb} MiB\n"
-            f"媒体缓存清理：{cleanup_status}\n"
+            f"图片下载上限：{self.config.delivery.max_media_size_mb} MiB\n"
             f"合并转发阈值：超过 {self.config.delivery.forward_batch_threshold} 条\n"
             f"轮询间隔：{self.config.nitter.poll_interval_seconds} 秒"
         )
@@ -1057,7 +949,6 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         post = await self._prepare_post(client, post, tolerate_media_errors=True)
 
         selected_media = self._select_media(post.media)
-        media_cache: Dict[str, CachedMedia] = {}
         message_text = self._format_post_text(post)
         if not await self._send_post_message(stream_id, message_text):
             raise RuntimeError("发送推文正文失败")
@@ -1070,7 +961,6 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                     media,
                     index,
                     stream_id,
-                    media_cache,
                 )
             except Exception:
                 self.ctx.logger.warning(
@@ -1247,9 +1137,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         """构造合并转发节点，并限制单次 RPC 中内嵌图片的总大小。"""
 
         nodes: List[Dict[str, Any]] = []
-        media_cache: Dict[str, CachedMedia] = {}
-        configured_media_bytes = self.config.delivery.max_media_size_mb * 1024 * 1024
-        inline_budget = min(configured_media_bytes, MAX_INLINE_MEDIA_BYTES)
+        inline_budget = self.config.delivery.max_media_size_mb * 1024 * 1024
         inline_bytes = 0
 
         for post in posts:
@@ -1257,51 +1145,38 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 {"type": "text", "content": self._format_post_text(post)}
             ]
             for index, media in enumerate(self._select_media(post.media), start=1):
-                file_name = self._build_media_filename(post, media, index, media.mime_type)
-                try:
-                    cached_media = await self._cache_media(
-                        client,
-                        media,
-                        file_name,
-                        media_cache,
-                    )
-                except (MediaTooLargeError, MediaCacheLimitError):
-                    self.ctx.logger.warning(
-                        "推文 %s 的媒体超过缓存下载上限，改用原始 URL 文件节点: %s",
-                        post.post_id,
-                        media.url,
-                    )
-                    media_url = media.url
-                    content_type = self._media_content_type(media)
-                except Exception:
-                    if not tolerate_media_errors:
-                        raise
-                    self.ctx.logger.warning(
-                        "缓存推文 %s 的合并转发媒体失败，改用原始 URL 文件节点: %s",
-                        post.post_id,
-                        media.url,
-                        exc_info=True,
-                    )
-                    media_url = media.url
-                    content_type = self._media_content_type(media)
-                else:
-                    media_url = cached_media.public_url
-                    content_type = cached_media.content_type
-                    if media.media_type == "image" and inline_bytes + cached_media.size <= inline_budget:
-                        media_data = await asyncio.to_thread(cached_media.path.read_bytes)
-                        inline_bytes += len(media_data)
-                        segments.append(
-                            {
-                                "type": "image",
-                                "content": base64.b64encode(media_data).decode("ascii"),
-                            }
-                        )
-                        continue
-                    if media.media_type == "image":
-                        self.ctx.logger.warning(
-                            "合并转发的内嵌图片累计达到 %d MiB，后续图片改用缓存文件节点",
-                            inline_budget // 1024 // 1024,
-                        )
+                content_type = self._media_content_type(media)
+                if media.media_type == "image":
+                    remaining_bytes = inline_budget - inline_bytes
+                    if remaining_bytes > 0:
+                        try:
+                            media_data, content_type = await client.download_media(
+                                media.url,
+                                remaining_bytes,
+                            )
+                        except MediaTooLargeError:
+                            self.ctx.logger.warning(
+                                "合并转发的内嵌图片累计达到 %d MiB，后续图片改用原始 URL 文件节点",
+                                inline_budget // 1024 // 1024,
+                            )
+                        except Exception:
+                            if not tolerate_media_errors:
+                                raise
+                            self.ctx.logger.warning(
+                                "下载推文 %s 的合并转发图片失败，改用原始 URL 文件节点: %s",
+                                post.post_id,
+                                media.url,
+                                exc_info=True,
+                            )
+                        else:
+                            inline_bytes += len(media_data)
+                            segments.append(
+                                {
+                                    "type": "image",
+                                    "content": base64.b64encode(media_data).decode("ascii"),
+                                }
+                            )
+                            continue
 
                 segments.append(
                     {
@@ -1309,7 +1184,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                         "data": {
                             "name": self._build_media_filename(post, media, index, content_type),
                             "mime_type": content_type,
-                            "url": media_url,
+                            "url": media.url,
                         },
                     }
                 )
@@ -1324,83 +1199,6 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 }
             )
         return nodes
-
-    async def _start_media_services(self) -> None:
-        """初始化媒体缓存，并按配置启动已有缓存服务和清理任务。"""
-
-        media_config = self.config.media_cache
-        service = MediaCacheService(
-            data_dir=self.ctx.paths.data_dir,
-            bind_host=media_config.bind_host,
-            port=media_config.port,
-            public_base_url=media_config.public_base_url,
-            logger=self.ctx.logger,
-        )
-        await asyncio.to_thread(service.initialize)
-        self._media_cache_service = service
-        if not self.config.plugin.enabled:
-            return
-        if await asyncio.to_thread(service.has_cached_files):
-            await service.start()
-        self._start_media_cleanup()
-
-    async def _restart_media_services(self) -> None:
-        """在配置热更新后重新应用媒体服务参数。"""
-
-        await self._stop_media_services()
-        await self._start_media_services()
-
-    async def _stop_media_services(self) -> None:
-        """停止媒体清理任务和临时 HTTP 文件服务。"""
-
-        await self._stop_media_cleanup()
-        service = self._media_cache_service
-        self._media_cache_service = None
-        if service is not None:
-            await service.stop()
-
-    def _start_media_cleanup(self) -> None:
-        """在开启自动清理时启动每日北京时间调度任务。"""
-
-        if not self.config.media_cache.cleanup_enabled:
-            return
-        if self._media_cleanup_task is not None and not self._media_cleanup_task.done():
-            return
-        self._media_cleanup_task = asyncio.create_task(
-            self._media_cleanup_loop(),
-            name="nitter_to_maibot_media_cleanup",
-        )
-
-    async def _stop_media_cleanup(self) -> None:
-        """取消并等待媒体缓存清理任务结束。"""
-
-        if self._media_cleanup_task is None:
-            return
-        task = self._media_cleanup_task
-        self._media_cleanup_task = None
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
-
-    async def _media_cleanup_loop(self) -> None:
-        """每天在配置的北京时间清理全部已完成媒体缓存。"""
-
-        while True:
-            delay_seconds = seconds_until_cleanup(self.config.media_cache.cleanup_time)
-            await asyncio.sleep(delay_seconds)
-            try:
-                removed_files, removed_bytes = await self._require_media_cache_service().clear()
-                self.ctx.logger.info(
-                    "推文媒体缓存定时清理完成：files=%d，bytes=%d",
-                    removed_files,
-                    removed_bytes,
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception:
-                self.ctx.logger.error("推文媒体缓存定时清理失败", exc_info=True)
 
     def _start_polling(self) -> None:
         """确保后台轮询任务只启动一次。"""
@@ -1598,7 +1396,6 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
 
         message_text = self._format_post_text(post)
         selected_media = self._select_media(post.media)
-        media_cache: Dict[str, CachedMedia] = {}
         completed_tokens = self._require_state_store().completed_tokens(
             post.account,
             post.post_id,
@@ -1624,7 +1421,6 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 media,
                 index,
                 stream_id,
-                media_cache,
             )
             if not media_sent:
                 raise RuntimeError(f"向 QQ 群 {group_id} 发送推文附件失败: {media.url}")
@@ -1665,25 +1461,6 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         stream_cache[group_id] = stream_id
         return stream_id
 
-    async def _cache_media(
-        self,
-        client: NitterClient,
-        media: MediaAttachment,
-        file_name: str,
-        media_cache: Dict[str, CachedMedia],
-    ) -> CachedMedia:
-        """把媒体下载到插件缓存，并在同一轮多群投递间复用。"""
-
-        if media.url not in media_cache:
-            max_bytes = self.config.delivery.max_media_size_mb * 1024 * 1024
-            media_cache[media.url] = await self._require_media_cache_service().cache_media(
-                media.url,
-                file_name,
-                max_bytes,
-                client.download_media_to_file,
-            )
-        return media_cache[media.url]
-
     async def _send_post_message(self, stream_id: str, message_text: str) -> bool:
         """发送推文正文。"""
 
@@ -1696,31 +1473,20 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         media: MediaAttachment,
         index: int,
         stream_id: str,
-        media_cache: Dict[str, CachedMedia],
     ) -> bool:
-        """先缓存单个媒体；小图片走 Base64，视频和大图使用缓存 URL。"""
+        """图片下载后内嵌发送，视频和其他附件使用原始 URL 文件消息。"""
 
         content_type = self._media_content_type(media)
-        file_name = self._build_media_filename(post, media, index, content_type)
-        try:
-            cached_media = await self._cache_media(client, media, file_name, media_cache)
-        except (MediaTooLargeError, MediaCacheLimitError):
-            self.ctx.logger.warning("推文媒体超过缓存下载上限，改用原始 URL 文件消息: %s", media.url)
-            media_url = media.url
-        else:
-            content_type = cached_media.content_type
-            media_url = cached_media.public_url
-            if media.media_type == "image" and cached_media.size <= MAX_INLINE_MEDIA_BYTES:
-                media_data = await asyncio.to_thread(cached_media.path.read_bytes)
-                return bool(
-                    await self.ctx.send.image(
-                        base64.b64encode(media_data).decode("ascii"),
-                        stream_id,
-                        processed_plain_text="[推文图片]",
-                    )
+        if media.media_type == "image":
+            max_bytes = self.config.delivery.max_media_size_mb * 1024 * 1024
+            media_data, content_type = await client.download_media(media.url, max_bytes)
+            return bool(
+                await self.ctx.send.image(
+                    base64.b64encode(media_data).decode("ascii"),
+                    stream_id,
+                    processed_plain_text="[推文图片]",
                 )
-            if media.media_type == "image":
-                self.ctx.logger.warning("推文图片超过 10 MiB 内嵌安全上限，改用缓存文件消息: %s", media.url)
+            )
 
         return bool(
             await self.ctx.send.custom(
@@ -1728,7 +1494,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 {
                     "name": self._build_media_filename(post, media, index, content_type),
                     "mime_type": content_type,
-                    "url": media_url,
+                    "url": media.url,
                 },
                 stream_id,
                 processed_plain_text="[推文附件]",
@@ -1818,13 +1584,6 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         if self._state_store is None:
             raise RuntimeError("NitterToMaiBot 状态存储尚未初始化")
         return self._state_store
-
-    def _require_media_cache_service(self) -> MediaCacheService:
-        """返回已经初始化的媒体缓存服务。"""
-
-        if self._media_cache_service is None:
-            raise RuntimeError("NitterToMaiBot 媒体缓存服务尚未初始化")
-        return self._media_cache_service
 
     async def _sync_subscription_mirror(self) -> None:
         """把真实订阅快照写入后台只读展示，并移除旧全局订阅字段。"""

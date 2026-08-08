@@ -1,10 +1,7 @@
 """Nitter RSS 与状态页解析测试。"""
 
 from datetime import timezone
-from pathlib import Path
-from tempfile import TemporaryDirectory
 from unittest import TestCase
-from unittest.mock import patch
 
 from plugins.NitterToMaiBot.nitter_client import NitterClient, _MainTweetMediaParser
 
@@ -61,32 +58,6 @@ RETWEET_RSS_SAMPLE = b"""<?xml version="1.0" encoding="UTF-8"?>
   </channel>
 </rss>
 """
-
-
-class _ResponseHeaders(dict[str, str]):
-    """提供 urllib 响应头所需最小接口。"""
-
-    def get_content_type(self) -> str:
-        return "video/mp4"
-
-
-class _StreamingResponse:
-    """测试流式媒体下载使用的上下文响应。"""
-
-    def __init__(self, media_data: bytes) -> None:
-        self.headers = _ResponseHeaders({"Content-Length": str(len(media_data))})
-        self._media_data = media_data
-
-    def __enter__(self) -> "_StreamingResponse":
-        return self
-
-    def __exit__(self, *_args: object) -> None:
-        pass
-
-    def read(self, size: int) -> bytes:
-        chunk = self._media_data[:size]
-        self._media_data = self._media_data[size:]
-        return chunk
 
 
 class NitterClientParsingTests(TestCase):
@@ -174,21 +145,3 @@ class NitterClientParsingTests(TestCase):
         posts = self.client.parse_rss(RETWEET_RSS_SAMPLE, "subscriber")
 
         self.assertTrue(posts[0].is_retweet)
-
-    def test_media_can_stream_directly_to_file(self) -> None:
-        media_data = b"video-content"
-        with TemporaryDirectory() as temp_dir:
-            target_path = Path(temp_dir) / "video.part"
-            with patch(
-                "plugins.NitterToMaiBot.nitter_client.urlopen",
-                return_value=_StreamingResponse(media_data),
-            ):
-                size, content_type = self.client._request_to_file(
-                    "https://video.twimg.com/video.mp4",
-                    target_path,
-                    1024,
-                )
-
-            self.assertEqual(size, len(media_data))
-            self.assertEqual(content_type, "video/mp4")
-            self.assertEqual(target_path.read_bytes(), media_data)

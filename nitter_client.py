@@ -3,7 +3,6 @@
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 from urllib.error import HTTPError
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
@@ -308,21 +307,6 @@ class NitterClient:
 
         return await asyncio.to_thread(self._request_bytes, media_url, max_bytes)
 
-    async def download_media_to_file(
-        self,
-        media_url: str,
-        target_path: Path,
-        max_bytes: int,
-    ) -> Tuple[int, str]:
-        """把媒体流式写入指定临时文件，并执行严格的大小限制。"""
-
-        return await asyncio.to_thread(
-            self._request_to_file,
-            media_url,
-            target_path,
-            max_bytes,
-        )
-
     def parse_rss(self, raw_data: bytes, account: str) -> List[NitterPost]:
         """解析 Nitter RSS 文档。"""
 
@@ -408,53 +392,6 @@ class NitterClient:
             except MediaTooLargeError:
                 raise
             except Exception as exc:
-                last_error = exc
-                if attempt >= self.request_attempts or not self._is_retriable_error(exc):
-                    break
-                time.sleep(0.25 * attempt)
-
-        raise NitterClientError(
-            f"请求失败（已尝试 {self.request_attempts} 次）: {url}: {last_error}"
-        ) from last_error
-
-    def _request_to_file(self, url: str, target_path: Path, max_bytes: int) -> Tuple[int, str]:
-        """流式下载资源到临时文件，避免把大媒体完整保存在内存中。"""
-
-        request_url = self._normalize_request_url(url)
-        parsed_url = urlsplit(request_url)
-        if parsed_url.scheme not in {"http", "https"} or not parsed_url.netloc:
-            raise NitterClientError(f"不支持的 URL: {url}")
-
-        request = Request(request_url, headers=NITTER_REQUEST_HEADERS)
-        last_error: Optional[Exception] = None
-        target_path.parent.mkdir(parents=True, exist_ok=True)
-        for attempt in range(1, self.request_attempts + 1):
-            try:
-                with urlopen(request, timeout=self.timeout_seconds) as response:
-                    raw_length = response.headers.get("Content-Length")
-                    if raw_length and int(raw_length) > max_bytes:
-                        raise MediaTooLargeError(
-                            f"资源大小 {int(raw_length)} 字节超过限制 {max_bytes} 字节: {url}"
-                        )
-
-                    downloaded_bytes = 0
-                    with target_path.open("wb") as media_file:
-                        while True:
-                            chunk = response.read(min(1024 * 1024, max_bytes - downloaded_bytes + 1))
-                            if not chunk:
-                                break
-                            downloaded_bytes += len(chunk)
-                            if downloaded_bytes > max_bytes:
-                                raise MediaTooLargeError(f"资源超过限制 {max_bytes} 字节: {url}")
-                            media_file.write(chunk)
-                    return downloaded_bytes, response.headers.get_content_type()
-            except MediaTooLargeError:
-                if target_path.exists():
-                    target_path.unlink()
-                raise
-            except Exception as exc:
-                if target_path.exists():
-                    target_path.unlink()
                 last_error = exc
                 if attempt >= self.request_attempts or not self._is_retriable_error(exc):
                     break

@@ -1,6 +1,6 @@
 [plugin]
 enabled = false
-config_version = "1.6.0"
+config_version = "1.5.1"
 
 [nitter]
 base_url = "https://nitter.net"
@@ -26,14 +26,7 @@ send_images = true
 send_videos = true
 send_other_files = true
 forward_batch_threshold = 1
-max_media_size_mb = 100
-
-[media_cache]
-bind_host = "127.0.0.1"
-port = 18080
-public_base_url = "http://127.0.0.1:18080"
-cleanup_enabled = true
-cleanup_time = "02:00"
+max_media_size_mb = 10
 
 [interaction]
 allow_group_commands = true

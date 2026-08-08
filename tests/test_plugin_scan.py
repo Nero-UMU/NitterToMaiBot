@@ -61,19 +61,6 @@ class _FakeNitterClient:
             return b"fake-image", "image/jpeg"
         return b"fake-video", "video/mp4"
 
-    async def download_media_to_file(
-        self,
-        media_url: str,
-        target_path: Path,
-        max_bytes: int,
-    ) -> Tuple[int, str]:
-        del max_bytes
-        media_data = b"fake-image" if media_url.endswith(".jpg") else b"fake-video"
-        content_type = "image/jpeg" if media_url.endswith(".jpg") else "video/mp4"
-        target_path.write_bytes(media_data)
-        return len(media_data), content_type
-
-
 class _MultiAccountNitterClient:
     """为两个订阅账号各返回一条新推文。"""
 
@@ -279,8 +266,7 @@ class PluginScanTests(IsolatedAsyncioTestCase):
             for _method, payload in calls
             if payload["capability"] == "send.custom"
         )
-        self.assertTrue(file_payload["url"].startswith("http://127.0.0.1:18080/nitter-media/"))
-        self.assertNotEqual(file_payload["url"], "https://video.twimg.com/video.mp4")
+        self.assertEqual(file_payload["url"], "https://video.twimg.com/video.mp4")
         self.assertNotIn("base64", file_payload)
 
     async def test_scan_batches_multiple_accounts_for_same_group(self) -> None:

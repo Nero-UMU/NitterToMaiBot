@@ -8,7 +8,6 @@ import tomllib
 
 from plugins.NitterToMaiBot.plugin import (
     DeliverySectionConfig,
-    MediaCacheSectionConfig,
     NitterSectionConfig,
     NitterToMaiBotConfig,
     TRANSLATION_SYSTEM_PROMPT,
@@ -82,16 +81,11 @@ class PluginContractTests(TestCase):
         self.assertEqual(config.nitter.base_url, "https://nitter.net")
         self.assertEqual(config.nitter.poll_interval_seconds, 600)
         self.assertEqual(config.delivery.forward_batch_threshold, 1)
-        self.assertEqual(config.plugin.config_version, "1.6.0")
+        self.assertEqual(config.plugin.config_version, "1.5.1")
         self.assertFalse(config.translation.enabled)
         self.assertEqual(config.translation.model, "utils")
         self.assertEqual(config.translation.prompt, TRANSLATION_SYSTEM_PROMPT)
-        self.assertEqual(config.delivery.max_media_size_mb, 100)
-        self.assertTrue(config.media_cache.cleanup_enabled)
-        self.assertEqual(config.media_cache.cleanup_time, "02:00")
-        self.assertEqual(config.media_cache.bind_host, "127.0.0.1")
-        self.assertEqual(config.media_cache.port, 18080)
-        self.assertEqual(config.media_cache.public_base_url, "http://127.0.0.1:18080")
+        self.assertEqual(config.delivery.max_media_size_mb, 10)
         self.assertEqual(config.interaction.max_accounts_per_group, 0)
         self.assertTrue(config.interaction.auto_parse_tweet_links)
 
@@ -135,11 +129,3 @@ class PluginContractTests(TestCase):
         self.assertEqual(translation_fields["prompt"]["label"], "翻译提示词")
         self.assertEqual(translation_fields["prompt"]["default"], TRANSLATION_SYSTEM_PROMPT)
         self.assertEqual(translation_fields["prompt"]["ui_type"], "textarea")
-        media_cache_fields = schema["sections"]["media_cache"]["fields"]
-        self.assertEqual(media_cache_fields["cleanup_enabled"]["label"], "定期清理下载文件")
-        self.assertEqual(media_cache_fields["cleanup_time"]["label"], "每日清理时间")
-
-    def test_media_cache_time_validation(self) -> None:
-        self.assertEqual(MediaCacheSectionConfig(cleanup_time="2:00").cleanup_time, "02:00")
-        with self.assertRaises(ValueError):
-            MediaCacheSectionConfig(cleanup_time="24:00")

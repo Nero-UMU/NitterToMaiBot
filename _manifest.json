@@ -1,6 +1,6 @@
 {
   "manifest_version": 2,
-  "version": "1.6.0",
+  "version": "1.5.1",
   "name": "Nitter 推文转发",
   "description": "定期读取 Nitter 订阅账号的新推文，支持按 QQ 群独立订阅，并转发正文、图片和视频附件。",
   "author": {

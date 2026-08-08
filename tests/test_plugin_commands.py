@@ -9,7 +9,6 @@ from unittest.mock import AsyncMock, patch
 
 from maibot_sdk.context import PluginContext, PluginPaths
 
-from plugins.NitterToMaiBot.media_cache import CachedMedia
 from plugins.NitterToMaiBot.models import MediaAttachment, NitterPost
 from plugins.NitterToMaiBot.plugin import create_plugin
 from plugins.NitterToMaiBot.tests.helpers import use_temporary_config_mirror
@@ -37,6 +36,10 @@ class _CommandNitterClient:
 
     def profile_name(self, account: str) -> str:
         return f"{account} 显示名"
+
+    async def download_media(self, media_url: str, max_bytes: int) -> Tuple[bytes, str]:
+        self.media_download = (media_url, max_bytes)
+        return b"1234", "image/jpeg"
 
 
 class PluginCommandTests(IsolatedAsyncioTestCase):
@@ -76,7 +79,7 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
         self.assertEqual(hook_result, {"action": "abort"})
         self.assertEqual(continue_result, {"action": "continue"})
 
-    async def test_large_image_uses_url_file_instead_of_inline_rpc(self) -> None:
+    async def test_image_downloads_with_configured_limit_and_sends_inline(self) -> None:
         calls: List[Tuple[str, Dict[str, Any]]] = []
 
         async def rpc_call(
@@ -110,34 +113,19 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
         )
         media = MediaAttachment("https://example.com/large.jpg", "image", "image/jpeg")
 
-        with TemporaryDirectory() as temp_dir:
-            media_path = Path(temp_dir) / "large.jpg"
-            media_path.write_bytes(b"1234")
-            cached_media = CachedMedia(
-                path=media_path,
-                public_url="http://127.0.0.1:18080/nitter-media/token/large.jpg",
-                content_type="image/jpeg",
-                size=4,
-            )
-            with (
-                patch("plugins.NitterToMaiBot.plugin.MAX_INLINE_MEDIA_BYTES", 3),
-                patch.object(plugin, "_cache_media", AsyncMock(return_value=cached_media)),
-            ):
-                sent = await plugin._send_media_attachment(
-                    _CommandNitterClient("", 1, 1),
-                    post,
-                    media,
-                    1,
-                    "qq-private-stream",
-                    {},
-                )
+        client = _CommandNitterClient("", 1, 1)
+        sent = await plugin._send_media_attachment(
+            client,
+            post,
+            media,
+            1,
+            "qq-private-stream",
+        )
 
         self.assertTrue(sent)
-        self.assertEqual([capability for capability, _payload in calls], ["send.custom"])
-        self.assertEqual(
-            calls[0][1]["args"]["content"]["url"],
-            "http://127.0.0.1:18080/nitter-media/token/large.jpg",
-        )
+        self.assertEqual(client.media_download, (media.url, 10 * 1024 * 1024))
+        self.assertEqual([capability for capability, _payload in calls], ["send.image"])
+        self.assertEqual(calls[0][1]["args"]["image_base64"], "MTIzNA==")
 
     async def test_follow_command_persists_group_subscription(self) -> None:
         calls: List[Tuple[str, Dict[str, Any]]] = []
