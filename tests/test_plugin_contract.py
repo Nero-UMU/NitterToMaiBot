@@ -88,6 +88,17 @@ class PluginContractTests(TestCase):
         self.assertIn("send.forward", manifest["capabilities"])
         self.assertIn("llm.generate", manifest["capabilities"])
 
+    def test_project_uses_gpl_3_or_later(self) -> None:
+        project_dir = Path(__file__).parents[1]
+        with (project_dir / "_manifest.json").open("r", encoding="utf-8") as manifest_file:
+            manifest = json.load(manifest_file)
+        license_text = (project_dir / "LICENSE").read_text(encoding="utf-8")
+
+        self.assertEqual(manifest["license"], "GPL-3.0-or-later")
+        self.assertIn("SPDX-License-Identifier: GPL-3.0-or-later", license_text)
+        self.assertIn("GNU GENERAL PUBLIC LICENSE", license_text)
+        self.assertIn("Version 3, 29 June 2007", license_text)
+
     def test_config_model_defaults(self) -> None:
         config = NitterToMaiBotConfig()
         self.assertEqual(config.nitter.base_url, "https://nitter.net")

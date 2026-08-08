@@ -106,3 +106,7 @@ git clone https://github.com/Nero-UMU/NitterToMaiBot.git
 ## 注意事项
 
 > 插件会在聊天窗口中发送推文内容和原文链接，这些信息可能进入聊天上下文，并触发部分模型服务商的内容安全策略。请根据实际使用环境谨慎选择模型。
+
+## 许可证
+
+本项目采用 [GNU General Public License v3.0 or later](LICENSE)，SPDX 标识为 `GPL-3.0-or-later`。
