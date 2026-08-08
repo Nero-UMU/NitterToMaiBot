@@ -78,3 +78,7 @@ git clone https://github.com/Nero-UMU/NitterToMaiBot.git
 /推特解析 https://x.com/elonmusk/status/1234567890
 /推特推送 关闭
 ```
+
+## 注意事项
+
+> 插件会在聊天窗口中发送推文内容和原文链接，这些信息可能进入聊天上下文，并触发部分模型服务商的内容安全策略。请根据实际使用环境谨慎选择模型。
