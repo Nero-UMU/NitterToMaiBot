@@ -1194,26 +1194,34 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         if not self.config.translation.enabled or not source_text or post.translated_text:
             return post
 
-        result = await self.ctx.llm.generate(
-            prompt=[
-                {"role": "system", "content": self.config.translation.prompt},
-                {"role": "user", "content": source_text},
-            ],
-            model=self.config.translation.model,
-            temperature=0.1,
-            max_tokens=2048,
-        )
-        if not result.get("success"):
-            error = str(result.get("error") or "模型未返回成功结果")
-            raise RuntimeError(f"推文 {post.post_id} 翻译失败：{error}")
+        try:
+            result = await self.ctx.llm.generate(
+                prompt=[
+                    {"role": "system", "content": self.config.translation.prompt},
+                    {"role": "user", "content": source_text},
+                ],
+                model=self.config.translation.model,
+                temperature=0.1,
+                max_tokens=2048,
+            )
+            if not result.get("success"):
+                error = str(result.get("error") or "模型未返回成功结果")
+                raise RuntimeError(error)
 
-        translated_text = str(result.get("response") or "").strip()
-        for prefix in ("中文翻译：", "翻译："):
-            if translated_text.startswith(prefix):
-                translated_text = translated_text.removeprefix(prefix).strip()
-                break
-        if not translated_text:
-            raise RuntimeError(f"推文 {post.post_id} 翻译失败：模型返回了空内容")
+            translated_text = str(result.get("response") or "").strip()
+            for prefix in ("中文翻译：", "翻译："):
+                if translated_text.startswith(prefix):
+                    translated_text = translated_text.removeprefix(prefix).strip()
+                    break
+            if not translated_text:
+                raise RuntimeError("模型返回了空内容")
+        except Exception as exc:
+            self.ctx.logger.warning(
+                "推文 %s 翻译失败，将直接发送原文：%s",
+                post.post_id,
+                exc,
+            )
+            return post
         if translated_text == source_text:
             return post
         return replace(post, translated_text=translated_text)

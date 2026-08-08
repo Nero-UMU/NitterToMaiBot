@@ -197,8 +197,8 @@ class PluginScanTests(IsolatedAsyncioTestCase):
         )
         self.assertEqual(args["prompt"][1], {"role": "user", "content": "This is a test post."})
 
-    async def test_translation_failure_is_exposed(self) -> None:
-        """模型调用失败时不能把未翻译正文当成成功翻译。"""
+    async def test_translation_failure_uses_original_post(self) -> None:
+        """模型返回失败时应直接使用原文，不阻断后续投递。"""
 
         async def rpc_call(
             method: str,
@@ -221,8 +221,39 @@ class PluginScanTests(IsolatedAsyncioTestCase):
         )
         plugin._set_context(PluginContext(PLUGIN_ID, rpc_call=rpc_call))
 
-        with self.assertRaisesRegex(RuntimeError, "测试模型不可用"):
-            await plugin._prepare_post_translation(_FakeNitterClient.post)
+        prepared_post = await plugin._prepare_post_translation(_FakeNitterClient.post)
+
+        self.assertIs(prepared_post, _FakeNitterClient.post)
+        self.assertEqual(prepared_post.translated_text, "")
+
+    async def test_translation_exception_uses_original_post(self) -> None:
+        """模型 RPC 超时时应直接使用原文，不阻断后续投递。"""
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method
+            del plugin_id
+            del payload
+            del timeout_ms
+            raise TimeoutError("测试翻译超时")
+
+        plugin = create_plugin()
+        plugin.set_plugin_config(
+            {
+                "plugin": {"enabled": False, "config_version": "1.5.3"},
+                "translation": {"enabled": True, "model": "utils"},
+            }
+        )
+        plugin._set_context(PluginContext(PLUGIN_ID, rpc_call=rpc_call))
+
+        prepared_post = await plugin._prepare_post_translation(_FakeNitterClient.post)
+
+        self.assertIs(prepared_post, _FakeNitterClient.post)
+        self.assertEqual(prepared_post.translated_text, "")
 
     async def test_first_scan_can_forward_existing_post(self) -> None:
         calls: List[Tuple[str, Dict[str, Any]]] = []
