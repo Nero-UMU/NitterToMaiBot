@@ -4,7 +4,6 @@ from pathlib import Path
 from unittest import TestCase
 
 import json
-import tomllib
 
 from plugins.NitterToMaiBot.plugin import (
     DeliverySectionConfig,
@@ -89,12 +88,8 @@ class PluginContractTests(TestCase):
         self.assertIn("send.forward", manifest["capabilities"])
         self.assertIn("llm.generate", manifest["capabilities"])
 
-    def test_shipped_config_matches_model(self) -> None:
-        config_path = Path(__file__).parents[1] / "config.toml"
-        with config_path.open("rb") as config_file:
-            config_data = tomllib.load(config_file)
-
-        config = NitterToMaiBotConfig.model_validate(config_data)
+    def test_config_model_defaults(self) -> None:
+        config = NitterToMaiBotConfig()
         self.assertEqual(config.nitter.base_url, "https://nitter.net")
         self.assertEqual(config.nitter.poll_interval_seconds, 600)
         self.assertEqual(config.delivery.forward_batch_threshold, 1)
@@ -108,6 +103,12 @@ class PluginContractTests(TestCase):
         self.assertEqual(config.quiet_hours.end_time, "06:00")
         self.assertEqual(config.interaction.max_accounts_per_group, 0)
         self.assertTrue(config.interaction.auto_parse_tweet_links)
+
+    def test_runtime_config_is_ignored(self) -> None:
+        gitignore_path = Path(__file__).parents[1] / ".gitignore"
+        ignored_patterns = gitignore_path.read_text(encoding="utf-8").splitlines()
+
+        self.assertIn("/config.toml", ignored_patterns)
 
     def test_subscription_lists_are_read_only_in_schema(self) -> None:
         schema = create_plugin().build_config_schema()

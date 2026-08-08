@@ -1,16 +1,16 @@
 {
   "manifest_version": 2,
-  "version": "1.5.3",
+  "version": "1.5.4",
   "name": "Nitter 推文转发",
   "description": "定期读取 Nitter 订阅账号的新推文，支持按 QQ 群独立订阅，并转发正文、图片和视频附件。",
   "author": {
-    "name": "NitterToMaiBot 贡献者",
-    "url": "https://github.com/"
+    "name": "Nero-UMU",
+    "url": "https://github.com/Nero-UMU"
   },
   "license": "MIT",
   "urls": {
-    "repository": "https://github.com/",
-    "documentation": "https://github.com/"
+    "repository": "https://github.com/Nero-UMU/NitterToMaiBot",
+    "documentation": "https://github.com/Nero-UMU/NitterToMaiBot#readme"
   },
   "changelog": "CHANGELOG.md",
   "host_application": {

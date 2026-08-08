@@ -27,6 +27,8 @@ git clone https://github.com/Nero-UMU/NitterToMaiBot.git
 
 等待 MaiBot 识别并加载插件，然后在后台插件管理页面打开“Nitter 推文转发”。
 
+插件依赖会按照 `_manifest.json` 由 MaiBot 安装，无需手动安装 Python 包。首次加载时，Runner 会根据插件配置模型生成本地 `config.toml`。
+
 ### 基本设置
 
 在 MaiBot 后台打开本插件并完成以下设置：
@@ -80,6 +82,26 @@ git clone https://github.com/Nero-UMU/NitterToMaiBot.git
 /推特解析 https://x.com/elonmusk/status/1234567890
 /推特推送 关闭
 ```
+
+## 权限与能力
+
+- `chat.open_session`：打开目标 QQ 群的真实聊天流。
+- `send.text`、`send.image`、`send.custom`：发送推文正文、图片、视频和其他附件。
+- `send.forward`：发送多条推文或较长订阅列表的 QQ 合并转发。
+- `llm.generate`：仅在开启推文翻译后调用所选 MaiBot 模型任务。
+- `config.get`：读取插件运行配置。
+
+插件没有向 LLM 注册 Tool；聊天交互由命令和推文链接拦截处理。
+
+## 故障排查
+
+- **插件未出现或加载失败**：确认目录为 `plugins/NitterToMaiBot/`，并检查 MaiBot、插件 SDK 版本和加载日志。
+- **Nitter 返回 404 或连接失败**：在服务器上确认配置的 Nitter 实例可访问，并检查实例是否支持目标账号和状态页。
+- **没有自动推送**：确认插件、当前群推送和账号订阅均已开启；同时检查轮询间隔、静默时段和 `/nitter_status` 中的待发送数量。
+- **命令无法使用**：群订阅命令只能在 QQ 群聊中执行，并受“允许群内管理订阅”和“仅限本地操作员管理”设置影响。
+- **链接仍交给 LLM**：确认插件已启用，并开启“自动解析推文链接”。
+- **翻译模型返回内容安全错误**：推文正文和原文链接可能触发模型服务商风控，可关闭翻译或更换模型任务。
+- **图片或视频发送失败**：检查媒体大小上限、Nitter 媒体地址以及 QQ 适配器能否访问对应 URL。
 
 ## 注意事项
 
