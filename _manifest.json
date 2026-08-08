@@ -1,0 +1,55 @@
+{
+  "manifest_version": 2,
+  "version": "1.6.0",
+  "name": "Nitter 推文转发",
+  "description": "定期读取 Nitter 订阅账号的新推文，支持按 QQ 群独立订阅，并转发正文、图片和视频附件。",
+  "author": {
+    "name": "NitterToMaiBot 贡献者",
+    "url": "https://github.com/"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/",
+    "documentation": "https://github.com/"
+  },
+  "changelog": "CHANGELOG.md",
+  "host_application": {
+    "min_version": "1.1.4",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.7.1",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [
+    {
+      "type": "python_package",
+      "name": "tomlkit",
+      "version_spec": ">=0.13.3,<1"
+    }
+  ],
+  "capabilities": [
+    "chat.open_session",
+    "config.get",
+    "llm.generate",
+    "send.custom",
+    "send.forward",
+    "send.image",
+    "send.text"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "id": "third-party.nitter-to-maibot",
+  "plugin_type": "extension",
+  "display": {
+    "icon": {
+      "type": "lucide",
+      "value": "rss",
+      "background": "#15202B"
+    }
+  }
+}
