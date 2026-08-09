@@ -17,7 +17,13 @@ from .models import MediaAttachment, NitterPost
 
 
 MAX_DOCUMENT_BYTES = 4 * 1024 * 1024
+OFFICIAL_STATUS_BASE_URL = "https://x.com"
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,15}$")
+STATUS_URL_IN_TEXT_PATTERN = re.compile(
+    r"https?://[^\s<>/]+/(?P<account>[A-Za-z0-9_]{1,15})/status/"
+    r"(?P<post_id>\d+)(?:\?[^\s<>#]*)?(?:#m)?",
+    re.IGNORECASE,
+)
 NITTER_REQUEST_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -327,7 +333,9 @@ class NitterClient:
             description_parser = _DescriptionParser()
             description_parser.feed(raw_description)
             description_text = description_parser.text()
-            text = description_text if description_text else title.strip()
+            text = self._officialize_status_urls(
+                description_text if description_text else title.strip()
+            )
             published_at = self._parse_published_at(raw_published_at)
             has_video = bool(
                 re.search(r"<br\s*/?>\s*(?:Video|GIF)\s*<br\s*/?>", raw_description, re.IGNORECASE)
@@ -432,6 +440,18 @@ class NitterClient:
                 parsed_url.query,
                 "",
             )
+        )
+
+    @staticmethod
+    def _officialize_status_urls(text: str) -> str:
+        """将 RSS 正文中的 Nitter 推文链接改写为 x.com 原文链接。"""
+
+        return STATUS_URL_IN_TEXT_PATTERN.sub(
+            lambda match: (
+                f"{OFFICIAL_STATUS_BASE_URL}/{match.group('account')}/status/"
+                f"{match.group('post_id')}"
+            ),
+            text,
         )
 
     @staticmethod
