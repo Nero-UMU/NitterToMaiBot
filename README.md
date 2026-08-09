@@ -29,6 +29,12 @@ git clone https://github.com/Nero-UMU/NitterToMaiBot.git
 
 插件依赖会按照 `_manifest.json` 由 MaiBot 安装，无需手动安装 Python 包。首次加载时，Runner 会根据插件配置模型生成本地 `config.toml`。
 
+如需转发 Nitter HLS 视频，服务器还需安装 `ffmpeg`。Ubuntu/Debian 可执行：
+
+```bash
+sudo apt install ffmpeg
+```
+
 插件 ID 为 `github.nero-umu.nitter-to-maibot`；从旧 ID 升级时，插件会自动迁移原有订阅和去重状态。
 
 ### 基本设置
@@ -44,7 +50,7 @@ git clone https://github.com/Nero-UMU/NitterToMaiBot.git
 - **启用推文翻译**：默认关闭；开启后为自动推送、手动获取和链接解析结果增加中文翻译；翻译失败时继续发送原文，并在翻译区域显示“翻译错误”。
 - **翻译模型**：选择 `utils`、`replyer` 或 `planner` 模型任务，推荐使用 `utils`。
 - **翻译提示词**：默认已填写内置翻译要求，可以在后台直接修改并用于之后的所有推文翻译。
-- **媒体大小上限（MiB）**：默认 `10`，限制单张图片下载并内嵌发送的大小。
+- **媒体大小上限（MiB）**：默认 `10`，限制单张图片以及转封装后视频的大小；HLS 视频会优先选择不超过该上限的最高可用清晰度。
 
 订阅账号和目标群无需在后台手动填写，请直接使用下面的群内命令管理。
 
@@ -102,7 +108,7 @@ git clone https://github.com/Nero-UMU/NitterToMaiBot.git
 - **命令无法使用**：群订阅命令只能在 QQ 群聊中执行，并受“允许群内管理订阅”和“仅限本地操作员管理”设置影响。
 - **链接仍交给 LLM**：确认插件已启用，并开启“自动解析推文链接”。
 - **翻译模型返回内容安全错误**：推文正文和原文链接可能触发模型服务商风控，可关闭翻译或更换模型任务。
-- **图片或视频发送失败**：检查媒体大小上限、Nitter 媒体地址以及 QQ 适配器能否访问对应 URL。
+- **图片或视频发送失败**：检查媒体大小上限、Nitter 媒体地址、服务器是否安装 FFmpeg，以及 QQ 适配器是否正常运行。
 
 ## 注意事项
 

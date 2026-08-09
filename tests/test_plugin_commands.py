@@ -154,6 +154,71 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
         self.assertEqual([capability for capability, _payload in calls], ["send.image"])
         self.assertEqual(calls[0][1]["args"]["image_base64"], "MTIzNA==")
 
+    async def test_hls_video_is_materialized_and_sent_as_local_video(self) -> None:
+        calls: List[Tuple[str, Dict[str, Any]]] = []
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method
+            del plugin_id
+            del timeout_ms
+            calls.append((str(payload["capability"]), payload))
+            return {"success": True}
+
+        plugin = create_plugin()
+        plugin.set_plugin_config(
+            {
+                "plugin": {"enabled": False, "config_version": "1.4.1"},
+                "nitter": {"base_url": "http://127.0.0.1:8080"},
+            }
+        )
+        plugin._set_context(PluginContext(PLUGIN_ID, rpc_call=rpc_call))
+        post = NitterPost(
+            account="OpenAI",
+            post_id="123456",
+            author="@OpenAI",
+            text="测试推文",
+            published_at=datetime(2026, 8, 8, tzinfo=timezone.utc),
+            url="http://127.0.0.1:8080/OpenAI/status/123456",
+        )
+        media = MediaAttachment(
+            "http://127.0.0.1:8080/video/signature/source.m3u8",
+            "video",
+            "application/vnd.apple.mpegurl",
+        )
+        client = _CommandNitterClient("", 1, 1)
+
+        with TemporaryDirectory() as temp_dir:
+            video_path = Path(temp_dir) / "tweet.mp4"
+            video_path.write_bytes(b"test video")
+            with patch.object(
+                plugin,
+                "_materialize_hls_video",
+                AsyncMock(return_value=video_path),
+            ):
+                sent = await plugin._send_media_attachment(
+                    client,
+                    post,
+                    media,
+                    1,
+                    "qq-private-stream",
+                )
+            self.assertFalse(video_path.exists())
+
+        self.assertTrue(sent)
+        self.assertFalse(hasattr(client, "media_download"))
+        self.assertEqual(
+            [capability for capability, _payload in calls],
+            ["send.custom"],
+        )
+        args = calls[0][1]["args"]
+        self.assertEqual(args["custom_type"], "video")
+        self.assertEqual(args["content"], {"file": str(video_path)})
+
     async def test_follow_command_persists_group_subscription(self) -> None:
         calls: List[Tuple[str, Dict[str, Any]]] = []
 

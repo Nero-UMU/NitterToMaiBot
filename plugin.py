@@ -4,6 +4,8 @@ from dataclasses import replace
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
+from shutil import which
+from tempfile import mkstemp
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo
@@ -11,6 +13,7 @@ from zoneinfo import ZoneInfo
 import asyncio
 import base64
 import mimetypes
+import os
 import re
 
 from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase
@@ -19,7 +22,7 @@ from pydantic import field_validator, model_validator
 
 from .config_mirror import SubscriptionConfigMirror
 from .models import MediaAttachment, NitterPost, ScanSummary
-from .nitter_client import MediaTooLargeError, NitterClient
+from .nitter_client import MediaTooLargeError, NitterClient, NitterClientError
 from .state_store import StateStore
 from .subscription_store import SubscriptionStore
 
@@ -36,6 +39,7 @@ FORWARD_TOKEN = "forward"
 BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 OFFICIAL_STATUS_BASE_URL = "https://x.com"
 FOLLOW_LIST_FORWARD_THRESHOLD = 20
+HLS_VIDEO_TIMEOUT_SECONDS = 300
 PLUGIN_ID = "github.nero-umu.nitter-to-maibot"
 LEGACY_PLUGIN_ID = "third-party.nitter-to-maibot"
 MIGRATABLE_PLUGIN_DATA_FILES = frozenset({"state.json", "subscriptions.json"})
@@ -1719,6 +1723,29 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 )
             )
 
+        if media.media_type == "video":
+            if self._is_hls_video(media):
+                video_path = await self._materialize_hls_video(client, media)
+                try:
+                    return bool(
+                        await self.ctx.send.custom(
+                            "video",
+                            {"file": str(video_path)},
+                            stream_id,
+                            processed_plain_text="[推文视频]",
+                        )
+                    )
+                finally:
+                    await asyncio.to_thread(video_path.unlink, missing_ok=True)
+            return bool(
+                await self.ctx.send.custom(
+                    "videourl",
+                    {"url": media.url},
+                    stream_id,
+                    processed_plain_text="[推文视频]",
+                )
+            )
+
         return bool(
             await self.ctx.send.custom(
                 "file",
@@ -1730,6 +1757,97 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 stream_id,
                 processed_plain_text="[推文附件]",
             )
+        )
+
+    async def _materialize_hls_video(
+        self,
+        client: NitterClient,
+        media: MediaAttachment,
+    ) -> Path:
+        """把 Nitter 代理的 HLS 流无损转封装为 NapCat 可发送的临时 MP4。"""
+
+        ffmpeg_path = which("ffmpeg")
+        if not ffmpeg_path:
+            raise NitterClientError("服务器未安装 FFmpeg，无法处理 Nitter HLS 视频")
+
+        max_bytes = self.config.delivery.max_media_size_mb * 1024 * 1024
+        selection = await client.select_hls_stream(media.url, max_bytes)
+        runtime_dir = self.ctx.paths.runtime_dir / "nitter_video"
+        await asyncio.to_thread(runtime_dir.mkdir, parents=True, exist_ok=True)
+        file_descriptor, raw_path = mkstemp(
+            prefix="tweet_",
+            suffix=".mp4",
+            dir=runtime_dir,
+        )
+        os.close(file_descriptor)
+        output_path = Path(raw_path)
+
+        command = [
+            ffmpeg_path,
+            "-nostdin",
+            "-v",
+            "error",
+            "-y",
+            "-i",
+            selection.video_url,
+        ]
+        if selection.audio_url:
+            command.extend(["-i", selection.audio_url])
+        command.extend(["-map", "0:v:0"])
+        if selection.audio_url:
+            command.extend(["-map", "1:a:0"])
+        else:
+            command.extend(["-map", "0:a:0?"])
+        command.extend(["-c", "copy", "-movflags", "+faststart", str(output_path)])
+
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                _stdout, stderr = await asyncio.wait_for(
+                    process.communicate(),
+                    timeout=HLS_VIDEO_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError as exc:
+                process.kill()
+                await process.communicate()
+                raise NitterClientError(
+                    f"HLS 视频处理超过 {HLS_VIDEO_TIMEOUT_SECONDS} 秒"
+                ) from exc
+
+            if process.returncode != 0:
+                error_text = stderr.decode("utf-8", errors="replace").strip()
+                raise NitterClientError(
+                    f"FFmpeg 转封装 HLS 视频失败: {error_text[-1000:]}"
+                )
+
+            file_size = output_path.stat().st_size
+            if file_size <= 0:
+                raise NitterClientError("FFmpeg 没有生成有效的视频文件")
+            if file_size > max_bytes:
+                raise MediaTooLargeError(
+                    f"视频大小 {file_size} 字节超过限制 {max_bytes} 字节"
+                )
+            self.ctx.logger.info(
+                "HLS 视频已转封装为 MP4：estimated=%d bytes，actual=%d bytes",
+                selection.estimated_size_bytes,
+                file_size,
+            )
+            return output_path
+        except BaseException:
+            await asyncio.to_thread(output_path.unlink, missing_ok=True)
+            raise
+
+    @staticmethod
+    def _is_hls_video(media: MediaAttachment) -> bool:
+        """判断视频附件是否为 HLS 播放清单。"""
+
+        return (
+            media.mime_type == "application/vnd.apple.mpegurl"
+            or ".m3u8" in media.url.lower()
         )
 
     async def _record_delivery_token(self, post: NitterPost, group_id: str, token: str) -> None:

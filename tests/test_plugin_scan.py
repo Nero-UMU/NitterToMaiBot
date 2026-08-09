@@ -319,13 +319,17 @@ class PluginScanTests(IsolatedAsyncioTestCase):
             capabilities,
             ["chat.open_session", "send.text", "send.image", "send.custom"],
         )
-        file_payload = next(
-            payload["args"]["content"]
+        video_call = next(
+            payload["args"]
             for _method, payload in calls
             if payload["capability"] == "send.custom"
         )
-        self.assertEqual(file_payload["url"], "https://video.twimg.com/video.mp4")
-        self.assertNotIn("base64", file_payload)
+        self.assertEqual(video_call["custom_type"], "videourl")
+        self.assertEqual(
+            video_call["content"]["url"],
+            "https://video.twimg.com/video.mp4",
+        )
+        self.assertNotIn("base64", video_call["content"])
 
     async def test_scan_batches_multiple_accounts_for_same_group(self) -> None:
         """同一轮、同一目标群的多账号更新应合并为一条聊天记录。"""

@@ -3,6 +3,7 @@
 from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from html.parser import HTMLParser
+from math import ceil
 from typing import Dict, List, Optional, Tuple
 from urllib.error import HTTPError
 from urllib.parse import quote, urljoin, urlsplit, urlunsplit
@@ -13,12 +14,15 @@ import asyncio
 import re
 import time
 
-from .models import MediaAttachment, NitterPost
+from .models import HlsStreamSelection, MediaAttachment, NitterPost
 
 
 MAX_DOCUMENT_BYTES = 4 * 1024 * 1024
+MAX_HLS_PLAYLIST_BYTES = 512 * 1024
 OFFICIAL_STATUS_BASE_URL = "https://x.com"
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,15}$")
+HLS_ATTRIBUTE_PATTERN = re.compile(r'([A-Z0-9-]+)=("[^"]*"|[^,]*)')
+HLS_DURATION_PATTERN = re.compile(r"^#EXTINF:([0-9]+(?:\.[0-9]+)?)", re.MULTILINE)
 STATUS_URL_IN_TEXT_PATTERN = re.compile(
     r"https?://[^\s<>/]+/(?P<account>[A-Za-z0-9_]{1,15})/status/"
     r"(?P<post_id>\d+)(?:\?[^\s<>#]*)?(?:#m)?",
@@ -134,6 +138,14 @@ class _MainTweetMediaParser(HTMLParser):
             self.has_video = True
         if normalized_tag == "div" and "video-overlay" in classes:
             self.has_video = True
+        if normalized_tag == "video" and attributes.get("data-url"):
+            self.media.append(
+                (
+                    str(attributes["data-url"]),
+                    "video",
+                    "application/vnd.apple.mpegurl",
+                )
+            )
         if normalized_tag == "source" and attributes.get("src"):
             mime_type = str(attributes.get("type") or "")
             media_type = "video" if mime_type.startswith("video/") else "file"
@@ -313,6 +325,45 @@ class NitterClient:
 
         return await asyncio.to_thread(self._request_bytes, media_url, max_bytes)
 
+    async def select_hls_stream(
+        self,
+        playlist_url: str,
+        max_bytes: int,
+    ) -> HlsStreamSelection:
+        """选择预计不超过大小上限的最高码率 HLS 音视频流。"""
+
+        raw_master, _content_type = await asyncio.to_thread(
+            self._request_bytes,
+            playlist_url,
+            MAX_HLS_PLAYLIST_BYTES,
+        )
+        master_text = raw_master.decode("utf-8")
+        audio_urls, variants = self._parse_hls_master(master_text, playlist_url)
+        if not variants:
+            return HlsStreamSelection(playlist_url, None, 0)
+
+        selections: List[HlsStreamSelection] = []
+        for bandwidth, video_url, audio_group in sorted(variants, reverse=True):
+            raw_variant, _variant_content_type = await asyncio.to_thread(
+                self._request_bytes,
+                video_url,
+                MAX_HLS_PLAYLIST_BYTES,
+            )
+            duration_seconds = self._parse_hls_duration(raw_variant.decode("utf-8"))
+            if duration_seconds <= 0:
+                raise NitterClientError(f"无法解析 HLS 视频时长: {video_url}")
+            estimated_size = ceil(bandwidth * duration_seconds / 8)
+            selection = HlsStreamSelection(
+                video_url=video_url,
+                audio_url=audio_urls.get(audio_group),
+                estimated_size_bytes=estimated_size,
+            )
+            selections.append(selection)
+            if estimated_size <= max_bytes:
+                return selection
+
+        return selections[-1]
+
     def parse_rss(self, raw_data: bytes, account: str) -> List[NitterPost]:
         """解析 Nitter RSS 文档。"""
 
@@ -426,6 +477,61 @@ class NitterClient:
 
     def _absolute_url(self, raw_url: str) -> str:
         return urljoin(f"{self.base_url}/", raw_url)
+
+    @classmethod
+    def _parse_hls_master(
+        cls,
+        content: str,
+        playlist_url: str,
+    ) -> Tuple[Dict[str, str], List[Tuple[int, str, str]]]:
+        """解析 HLS 主清单中的音频组和视频变体。"""
+
+        lines = [line.strip() for line in content.splitlines() if line.strip()]
+        audio_urls: Dict[str, str] = {}
+        variants: List[Tuple[int, str, str]] = []
+        for index, line in enumerate(lines):
+            if line.startswith("#EXT-X-MEDIA:"):
+                attributes = cls._parse_hls_attributes(line.split(":", maxsplit=1)[1])
+                if attributes.get("TYPE") != "AUDIO":
+                    continue
+                group_id = attributes.get("GROUP-ID", "")
+                raw_uri = attributes.get("URI", "")
+                if group_id and raw_uri:
+                    audio_urls[group_id] = urljoin(playlist_url, raw_uri)
+                continue
+
+            if not line.startswith("#EXT-X-STREAM-INF:") or index + 1 >= len(lines):
+                continue
+            raw_uri = lines[index + 1]
+            if raw_uri.startswith("#"):
+                continue
+            attributes = cls._parse_hls_attributes(line.split(":", maxsplit=1)[1])
+            raw_bandwidth = attributes.get("AVERAGE-BANDWIDTH") or attributes.get("BANDWIDTH")
+            if not raw_bandwidth or not raw_bandwidth.isdigit():
+                continue
+            variants.append(
+                (
+                    int(raw_bandwidth),
+                    urljoin(playlist_url, raw_uri),
+                    attributes.get("AUDIO", ""),
+                )
+            )
+        return audio_urls, variants
+
+    @staticmethod
+    def _parse_hls_attributes(content: str) -> Dict[str, str]:
+        """解析 HLS 标签的逗号分隔属性，并保留 CODECS 中的逗号。"""
+
+        return {
+            key: raw_value.strip().strip('"')
+            for key, raw_value in HLS_ATTRIBUTE_PATTERN.findall(content)
+        }
+
+    @staticmethod
+    def _parse_hls_duration(content: str) -> float:
+        """累加媒体清单中的所有片段时长。"""
+
+        return sum(float(value) for value in HLS_DURATION_PATTERN.findall(content))
 
     @staticmethod
     def _normalize_request_url(url: str) -> str:

@@ -1,7 +1,9 @@
 """Nitter RSS 与状态页解析测试。"""
 
 from datetime import timezone
-from unittest import TestCase
+from typing import Tuple
+from unittest import IsolatedAsyncioTestCase, TestCase
+from unittest.mock import patch
 
 from plugins.NitterToMaiBot.nitter_client import NitterClient, _MainTweetMediaParser
 
@@ -83,6 +85,23 @@ QUOTE_RSS_SAMPLE = b"""<?xml version="1.0" encoding="UTF-8"?>
 </rss>
 """
 
+HLS_MASTER_SAMPLE = """#EXTM3U
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-low",URI="/video/audio-low.m3u8"
+#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio-high",URI="/video/audio-high.m3u8"
+#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=500000,CODECS="mp4a.40.2,avc1.4D401E",AUDIO="audio-low"
+/video/video-low.m3u8
+#EXT-X-STREAM-INF:AVERAGE-BANDWIDTH=2000000,CODECS="mp4a.40.2,avc1.64001F",AUDIO="audio-high"
+/video/video-high.m3u8
+"""
+
+HLS_VARIANT_SAMPLE = """#EXTM3U
+#EXTINF:10.0,
+/video/segment-1.m4s
+#EXTINF:10.0,
+/video/segment-2.m4s
+#EXT-X-ENDLIST
+"""
+
 
 class NitterClientParsingTests(TestCase):
     """验证解析、URL 改写和主推文媒体作用域。"""
@@ -144,6 +163,33 @@ class NitterClientParsingTests(TestCase):
             [("https://video.twimg.com/main.mp4", "video", "video/mp4")],
         )
 
+    def test_status_parser_extracts_nitter_proxy_hls_video(self) -> None:
+        parser = _MainTweetMediaParser()
+        parser.feed(
+            """
+            <div id="m" class="main-tweet">
+              <div class="gallery-video">
+                <video
+                  data-url="/video/signature/source.m3u8"
+                  data-autoload="false"
+                ></video>
+              </div>
+            </div>
+            """
+        )
+
+        self.assertTrue(parser.has_video)
+        self.assertEqual(
+            parser.media,
+            [
+                (
+                    "/video/signature/source.m3u8",
+                    "video",
+                    "application/vnd.apple.mpegurl",
+                )
+            ],
+        )
+
     def test_status_parser_extracts_main_post_and_excludes_quote_media(self) -> None:
         parser = _MainTweetMediaParser()
         parser.feed(
@@ -190,3 +236,40 @@ class NitterClientParsingTests(TestCase):
         posts = self.client.parse_rss(RETWEET_RSS_SAMPLE, "subscriber")
 
         self.assertTrue(posts[0].is_retweet)
+
+
+class NitterClientHlsTests(IsolatedAsyncioTestCase):
+    """验证 HLS 清晰度选择会遵守媒体大小上限。"""
+
+    async def test_selects_highest_variant_within_size_limit(self) -> None:
+        client = NitterClient("http://127.0.0.1:8080", 20)
+        master_url = "http://127.0.0.1:8080/video/master.m3u8"
+        responses = {
+            master_url: HLS_MASTER_SAMPLE.encode("utf-8"),
+            "http://127.0.0.1:8080/video/video-high.m3u8": HLS_VARIANT_SAMPLE.encode(
+                "utf-8"
+            ),
+            "http://127.0.0.1:8080/video/video-low.m3u8": HLS_VARIANT_SAMPLE.encode(
+                "utf-8"
+            ),
+        }
+
+        def request_bytes(url: str, max_bytes: int) -> Tuple[bytes, str]:
+            self.assertLessEqual(len(responses[url]), max_bytes)
+            return responses[url], "application/vnd.apple.mpegurl"
+
+        with patch.object(client, "_request_bytes", side_effect=request_bytes):
+            selection = await client.select_hls_stream(
+                master_url,
+                2 * 1024 * 1024,
+            )
+
+        self.assertEqual(
+            selection.video_url,
+            "http://127.0.0.1:8080/video/video-low.m3u8",
+        )
+        self.assertEqual(
+            selection.audio_url,
+            "http://127.0.0.1:8080/video/audio-low.m3u8",
+        )
+        self.assertEqual(selection.estimated_size_bytes, 1_250_000)

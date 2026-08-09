@@ -2,7 +2,16 @@
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import List
+from typing import List, Optional
+
+
+@dataclass(frozen=True)
+class HlsStreamSelection:
+    """从 HLS 主播放清单中选出的音视频流。"""
+
+    video_url: str
+    audio_url: Optional[str]
+    estimated_size_bytes: int
 
 
 @dataclass(frozen=True)
