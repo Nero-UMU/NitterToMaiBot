@@ -35,13 +35,14 @@ accounts = []
             )
             mirror = SubscriptionConfigMirror(config_path)
             snapshot = {
-                "version": 2,
+                "version": 3,
                 "groups": [{"group_id": "10001", "enabled": True}],
                 "accounts": [
                     {
                         "account": "OpenAI",
                         "display_name": "OpenAI 官方",
                         "qq_groups": ["10001"],
+                        "media_only_qq_groups": ["10001"],
                     }
                 ],
             }

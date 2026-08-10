@@ -92,17 +92,25 @@ class SubscriptionConfigMirror:
             account = raw_account.get("account")
             display_name = raw_account.get("display_name", "")
             qq_groups = raw_account.get("qq_groups")
+            media_only_qq_groups = raw_account.get("media_only_qq_groups")
             if (
                 not isinstance(account, str)
                 or not isinstance(display_name, str)
                 or not isinstance(qq_groups, list)
+                or not isinstance(media_only_qq_groups, list)
             ):
                 raise TypeError("订阅快照的账号记录字段无效")
             if not all(isinstance(group_id, str) for group_id in qq_groups):
                 raise TypeError("订阅快照的账号群列表必须只包含字符串")
+            if not all(
+                isinstance(group_id, str) and group_id in qq_groups
+                for group_id in media_only_qq_groups
+            ):
+                raise TypeError("订阅快照的仅媒体群必须属于账号订阅群")
             account_snapshot: Dict[str, object] = {
                 "account": account,
                 "qq_groups": list(qq_groups),
+                "media_only_qq_groups": list(media_only_qq_groups),
             }
             if display_name:
                 account_snapshot["display_name"] = display_name
@@ -130,6 +138,7 @@ class SubscriptionConfigMirror:
             if "display_name" in account:
                 account_table.add("display_name", account["display_name"])
             account_table.add("qq_groups", account["qq_groups"])
+            account_table.add("media_only_qq_groups", account["media_only_qq_groups"])
             account_tables.append(account_table)
         subscriptions.add("accounts", account_tables)
         return subscriptions

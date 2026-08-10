@@ -91,8 +91,11 @@ class PluginMigrationTests(IsolatedAsyncioTestCase):
             with config_path.open("rb") as config_file:
                 mirrored_config = tomllib.load(config_file)
 
-            self.assertEqual(targets, {"elonmusk": ["10001"], "OpenAI": ["10002"]})
-            self.assertEqual(subscriptions["version"], 2)
+            self.assertEqual(
+                targets,
+                {"elonmusk": {"10001": False}, "OpenAI": {"10002": False}},
+            )
+            self.assertEqual(subscriptions["version"], 3)
             self.assertEqual(mirrored_config["nitter"]["accounts"], [])
             self.assertEqual(mirrored_config["delivery"]["qq_groups"], [])
             self.assertEqual(mirrored_config["subscriptions"]["groups"], subscriptions["groups"])
@@ -148,5 +151,5 @@ class PluginMigrationTests(IsolatedAsyncioTestCase):
             self.assertFalse(legacy_data_dir.exists())
             self.assertTrue((new_data_dir / "state.json").is_file())
             self.assertTrue((new_data_dir / "subscriptions.json").is_file())
-            self.assertEqual(targets, {"OpenAI": ["10001"]})
+            self.assertEqual(targets, {"OpenAI": {"10001": False}})
             self.assertTrue(state_store.is_seen("OpenAI", "123"))

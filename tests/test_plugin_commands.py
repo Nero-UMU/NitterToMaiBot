@@ -67,7 +67,9 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
 
         self.assertTrue(result[0])
         self.assertEqual(result[2], 2)
-        self.assertIn("/推特关注 <账号1> [账号2 ...]", result[1])
+        self.assertIn("/推特关注 <账号1> [账号2 ...] [仅媒体]", result[1])
+        self.assertIn("/推特订阅查询", result[1])
+        self.assertIn("/推特仅媒体 on|off", result[1])
         self.assertIn("/twitter_help", result[1])
         self.assertEqual([capability for capability, _payload in calls], ["send.text"])
         self.assertEqual(calls[0][1]["args"]["text"], result[1])
@@ -270,8 +272,73 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
 
         self.assertTrue(success)
         self.assertEqual(intercept, 2)
-        self.assertEqual(targets, {"OpenAI": ["10001"]})
+        self.assertEqual(targets, {"OpenAI": {"10001": False}})
         self.assertEqual([payload["capability"] for _method, payload in calls], ["send.text"])
+
+    async def test_follow_command_sets_media_only_mode_for_multiple_accounts(self) -> None:
+        calls: List[Tuple[str, Dict[str, Any]]] = []
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method
+            del plugin_id
+            del timeout_ms
+            calls.append((str(payload["capability"]), payload))
+            return {"success": True}
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {
+                    "plugin": {"enabled": False, "config_version": "1.5.3"},
+                    "nitter": {"base_url": "http://127.0.0.1:8080"},
+                    "interaction": {"allow_group_commands": True},
+                }
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    rpc_call=rpc_call,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+
+            with patch("plugins.NitterToMaiBot.plugin.NitterClient", _CommandNitterClient):
+                media_result = await plugin.handle_follow(
+                    stream_id="qq-group-stream",
+                    group_id="10001",
+                    platform="qq",
+                    matched_groups={"accounts": "@OpenAI @elonmusk 仅媒体"},
+                )
+                all_posts_result = await plugin.handle_follow(
+                    stream_id="qq-group-stream",
+                    group_id="10001",
+                    platform="qq",
+                    matched_groups={"accounts": "@OpenAI"},
+                )
+
+            targets = plugin._build_scan_targets()
+            await plugin.on_unload()
+
+        self.assertTrue(media_result[0])
+        self.assertIn("@OpenAI [仅媒体]", media_result[1])
+        self.assertIn("@elonmusk [仅媒体]", media_result[1])
+        self.assertTrue(all_posts_result[0])
+        self.assertIn("已将当前群的 @OpenAI 设置为 [全部推文]", all_posts_result[1])
+        self.assertEqual(
+            targets,
+            {"OpenAI": {"10001": False}, "elonmusk": {"10001": True}},
+        )
+        self.assertEqual([capability for capability, _payload in calls], ["send.text", "send.text"])
 
     async def test_list_follows_uses_forward_above_twenty_accounts(self) -> None:
         """超过 20 个订阅时按每节点 20 个发送带显示名的合并转发。"""
@@ -320,7 +387,7 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
                 group_id="10001",
                 platform="qq",
             )
-            subscription_store.subscribe("10001", "user21")
+            subscription_store.subscribe("10001", "user21", media_only=True)
             subscription_store.set_display_name("user21", "推特名 21")
             await plugin.handle_list_follows(
                 stream_id="qq-group-stream",
@@ -335,16 +402,83 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
         )
         self.assertTrue(
             calls[0][1]["args"]["text"].startswith(
-                "当前群推送：开启\n订阅账号（20 个）：\n1.@user01 推特名 1"
+                "当前群推送：开启\n订阅账号（20 个）：\n1.@user01 推特名 1 [全部推文]"
             )
         )
         nodes = calls[1][1]["args"]["messages"]
         self.assertEqual(len(nodes), 2)
         first_content = nodes[0]["segments"][0]["content"]
         second_content = nodes[1]["segments"][0]["content"]
-        self.assertTrue(first_content.startswith("当前群推送：开启\n订阅账号（21 个）：\n1.@user01 推特名 1"))
-        self.assertIn("20.@user20 推特名 20", first_content)
-        self.assertEqual(second_content, "21.@user21 推特名 21")
+        self.assertTrue(
+            first_content.startswith(
+                "当前群推送：开启\n订阅账号（21 个）：\n1.@user01 推特名 1 [全部推文]"
+            )
+        )
+        self.assertIn("20.@user20 推特名 20 [全部推文]", first_content)
+        self.assertEqual(second_content, "21.@user21 推特名 21 [仅媒体]")
+
+    async def test_group_media_only_command_updates_all_subscriptions(self) -> None:
+        calls: List[Tuple[str, Dict[str, Any]]] = []
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method
+            del plugin_id
+            del timeout_ms
+            calls.append((str(payload["capability"]), payload))
+            return {"success": True}
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {
+                    "plugin": {"enabled": False, "config_version": "1.5.3"},
+                    "interaction": {"allow_group_commands": True},
+                }
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    rpc_call=rpc_call,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+            subscription_store = plugin._require_subscription_store()
+            subscription_store.subscribe("10001", "OpenAI")
+            subscription_store.subscribe("10001", "elonmusk", media_only=True)
+
+            enabled_result = await plugin.handle_set_group_media_only(
+                stream_id="qq-group-stream",
+                group_id="10001",
+                platform="qq",
+                matched_groups={"status": "on"},
+            )
+            enabled_modes = subscription_store.subscriptions_for_group("10001")
+            disabled_result = await plugin.handle_set_group_media_only(
+                stream_id="qq-group-stream",
+                group_id="10001",
+                platform="qq",
+                matched_groups={"status": "off"},
+            )
+            disabled_modes = subscription_store.subscriptions_for_group("10001")
+            await plugin.on_unload()
+
+        self.assertTrue(enabled_result[0])
+        self.assertIn("2 个订阅统一设置为 [仅媒体]", enabled_result[1])
+        self.assertEqual(enabled_modes, [("OpenAI", True), ("elonmusk", True)])
+        self.assertTrue(disabled_result[0])
+        self.assertIn("2 个订阅统一设置为 [全部推文]", disabled_result[1])
+        self.assertEqual(disabled_modes, [("OpenAI", False), ("elonmusk", False)])
+        self.assertEqual([capability for capability, _payload in calls], ["send.text", "send.text"])
 
     async def test_posts_command_uses_default_and_requested_count(self) -> None:
         """推文命令默认发送一条，并支持显式指定发送数量。"""

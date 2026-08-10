@@ -51,9 +51,10 @@ TRANSLATION_SYSTEM_PROMPT = (
 HELP_TEXT = """推特命令帮助
 
 订阅管理（仅 QQ 群聊）
-/推特关注 <账号1> [账号2 ...]：订阅账号
+/推特关注 <账号1> [账号2 ...] [仅媒体]：订阅账号，可只接收带媒体的推文
 /推特取关 <账号1> [账号2 ...]：取消订阅
-/推特订阅：查看当前群订阅
+/推特订阅查询：查看当前群订阅及每个账号的推送类型
+/推特仅媒体 on|off：把本群全部订阅设为仅媒体或全部推文
 /推特推送 开启|关闭：控制当前群推送
 
 推文获取（QQ 群聊或私聊）
@@ -65,7 +66,7 @@ HELP_TEXT = """推特命令帮助
 /nitter_scan：立即扫描一次订阅
 
 英文别名
-/twitter_help、/twitter_follow、/twitter_unfollow、/twitter_follows
+/twitter_help、/twitter_follow、/twitter_unfollow、/twitter_follows、/twitter_media_only
 /twitter_push、/twitter_posts、/twitter_parse"""
 TranslationModelTask = Literal["utils", "replyer", "planner"]
 
@@ -411,6 +412,10 @@ class SubscriptionAccountViewConfig(PluginConfigBase):
     account: str = Field(default="", description="推特账号 @ID")
     display_name: str = Field(default="", description="推特账号当前显示名")
     qq_groups: List[str] = Field(default_factory=list, description="订阅该账号的 QQ 群号")
+    media_only_qq_groups: List[str] = Field(
+        default_factory=list,
+        description="仅接收该账号带媒体推文的 QQ 群号",
+    )
 
 
 class SubscriptionViewSectionConfig(PluginConfigBase):
@@ -434,7 +439,7 @@ class SubscriptionViewSectionConfig(PluginConfigBase):
         description="推特账号及订阅该账号的 QQ 群；请使用群内命令修改",
         json_schema_extra={
             "disabled": True,
-            "hint": "只读展示；每个账号后的 QQ 群列表表示哪些群订阅了该账号。",
+            "hint": "只读展示；仅媒体群号是订阅群号的子集，这些群不会接收该账号的纯文本推文。",
             "label": "账号订阅列表",
         },
     )
@@ -677,13 +682,13 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
 
         raw_accounts = "" if matched_groups is None else str(matched_groups.get("accounts") or "")
         try:
-            accounts = self._parse_accounts(raw_accounts)
+            accounts, media_only = self._parse_follow_request(raw_accounts)
         except ValueError as exc:
             return await self._command_response(False, str(exc), stream_id)
         if not accounts:
             return await self._command_response(
                 False,
-                "请提供推特账号 ID。用法：/推特关注 <账号1> [账号2 ...]",
+                "请提供推特账号 ID。用法：/推特关注 <账号1> [账号2 ...] [仅媒体]",
                 stream_id,
             )
         if len(accounts) > 10:
@@ -693,6 +698,12 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         current_accounts = subscription_store.accounts_for_group(group_id)
         current_keys = {account.lower() for account in current_accounts}
         new_accounts = [account for account in accounts if account.lower() not in current_keys]
+        mode_updates = [
+            account
+            for account in accounts
+            if account.lower() in current_keys
+            and subscription_store.is_media_only(group_id, account) != media_only
+        ]
         account_limit = self.config.interaction.max_accounts_per_group
         if account_limit > 0 and len(current_accounts) + len(new_accounts) > account_limit:
             return await self._command_response(
@@ -704,19 +715,17 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         client = self._create_client()
         fetched_timelines: Dict[str, List[NitterPost]] = {}
         fetched_profile_names: Dict[str, str] = {}
-        result_lines: List[str] = []
-        for account in accounts:
-            if account.lower() in current_keys:
-                result_lines.append(f"○ @{account} 已在当前群的订阅列表中")
-                continue
+        result_by_account: Dict[str, str] = {}
+        mode_label = "仅媒体" if media_only else "全部推文"
+        for account in new_accounts:
             try:
                 posts = await client.fetch_timeline(account)
             except Exception:
                 self.ctx.logger.warning("群内订阅时读取 @%s 的 Nitter RSS 失败", account, exc_info=True)
-                result_lines.append(f"× @{account} 获取失败，请稍后重试")
+                result_by_account[account.lower()] = f"× @{account} 获取失败，请稍后重试"
                 continue
             if not posts:
-                result_lines.append(f"× @{account} 没有可读取的公开推文")
+                result_by_account[account.lower()] = f"× @{account} 没有可读取的公开推文"
                 continue
             fetched_timelines[account] = posts
             profile_name = client.profile_name(account)
@@ -724,14 +733,28 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 fetched_profile_names[account] = profile_name
 
         added_count = 0
-        if fetched_timelines:
+        updated_count = 0
+        if fetched_timelines or mode_updates:
             async with self._scan_lock:
                 async with self._subscription_lock:
                     state_store = self._require_state_store()
+                    for account in mode_updates:
+                        if subscription_store.set_media_only(group_id, account, media_only):
+                            updated_count += 1
+                            result_by_account[account.lower()] = (
+                                f"✓ 已将当前群的 @{account} 设置为 [{mode_label}]"
+                            )
                     for account, posts in fetched_timelines.items():
-                        if subscription_store.subscribe(group_id, account):
+                        if subscription_store.subscribe(group_id, account, media_only=media_only):
                             added_count += 1
-                            result_lines.append(f"✓ 已为当前群订阅 @{account}")
+                            result_by_account[account.lower()] = (
+                                f"✓ 已为当前群订阅 @{account} [{mode_label}]"
+                            )
+                        elif subscription_store.set_media_only(group_id, account, media_only):
+                            updated_count += 1
+                            result_by_account[account.lower()] = (
+                                f"✓ 已将当前群的 @{account} 设置为 [{mode_label}]"
+                            )
                         profile_name = fetched_profile_names.get(account, "")
                         if profile_name:
                             subscription_store.set_display_name(account, profile_name)
@@ -744,10 +767,26 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                     await asyncio.to_thread(state_store.save)
                     await self._sync_subscription_mirror()
 
-        if added_count > 0:
+        for account in accounts:
+            account_key = account.lower()
+            if account_key in result_by_account:
+                continue
+            result_by_account[account_key] = (
+                f"○ @{account} 已是当前群的 [{mode_label}] 订阅"
+            )
+
+        if added_count > 0 or updated_count > 0:
             self._wake_event.set()
-        response = f"订阅处理完成：新增 {added_count} 个。\n" + "\n".join(result_lines)
-        return await self._command_response(added_count > 0, response, stream_id)
+        result_lines = [result_by_account[account.lower()] for account in accounts]
+        response = (
+            f"订阅处理完成：新增 {added_count} 个，更新 {updated_count} 个。\n"
+            + "\n".join(result_lines)
+        )
+        return await self._command_response(
+            added_count > 0 or updated_count > 0,
+            response,
+            stream_id,
+        )
 
     @Command(
         "nitter_to_maibot_unfollow",
@@ -802,7 +841,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
     @Command(
         "nitter_to_maibot_list_follows",
         description="查看当前 QQ 群的动态推特订阅",
-        pattern=r"^/(?:推特订阅|twitter_follows)$",
+        pattern=r"^/(?:推特订阅查询|twitter_follows)$",
         timeout_ms=120000,
     )
     async def handle_list_follows(
@@ -818,18 +857,22 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         if platform.lower() != "qq" or not group_id:
             return await self._command_response(False, "该命令只能在 QQ 群聊中使用。", stream_id)
         subscription_store = self._require_subscription_store()
-        accounts = subscription_store.accounts_for_group(group_id)
-        if not accounts:
+        subscriptions = subscription_store.subscriptions_for_group(group_id)
+        if not subscriptions:
             response = "当前群还没有订阅推特账号。"
         else:
             status = "开启" if subscription_store.is_push_enabled(group_id) else "关闭"
-            header_lines = [f"当前群推送：{status}", f"订阅账号（{len(accounts)} 个）："]
+            header_lines = [f"当前群推送：{status}", f"订阅账号（{len(subscriptions)} 个）："]
             account_lines = [
-                f"{index}.@{account} {subscription_store.display_name(account) or '名称未获取'}"
-                for index, account in enumerate(accounts, start=1)
+                (
+                    f"{index}.@{account} "
+                    f"{subscription_store.display_name(account) or '名称未获取'} "
+                    f"[{'仅媒体' if media_only else '全部推文'}]"
+                )
+                for index, (account, media_only) in enumerate(subscriptions, start=1)
             ]
             response = "\n".join([*header_lines, *account_lines])
-            if len(accounts) > FOLLOW_LIST_FORWARD_THRESHOLD:
+            if len(subscriptions) > FOLLOW_LIST_FORWARD_THRESHOLD:
                 sent = await self._send_follow_list_forward(
                     header_lines,
                     account_lines,
@@ -842,6 +885,64 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                         stream_id,
                     )
                 return True, response, 2
+        return await self._command_response(True, response, stream_id)
+
+    @Command(
+        "nitter_to_maibot_set_group_media_only",
+        description="把当前 QQ 群的全部账号统一设为仅媒体或全部推文订阅",
+        pattern=r"^/(?:推特仅媒体|twitter_media_only)(?:\s+(?P<status>on|off))?$",
+    )
+    async def handle_set_group_media_only(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        platform: str = "",
+        is_local_operator: bool = False,
+        matched_groups: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Tuple[bool, str, int]:
+        """批量切换当前群所有账号的仅媒体标记。"""
+
+        del kwargs
+        context_error = self._group_manage_error(group_id, platform, is_local_operator)
+        if context_error:
+            return await self._command_response(False, context_error, stream_id)
+        raw_status = "" if matched_groups is None else str(matched_groups.get("status") or "").lower()
+        if raw_status not in {"on", "off"}:
+            return await self._command_response(
+                False,
+                "请指定 on 或 off。用法：/推特仅媒体 on|off",
+                stream_id,
+            )
+
+        media_only = raw_status == "on"
+        subscription_count = 0
+        changed_count = 0
+        async with self._scan_lock:
+            async with self._subscription_lock:
+                subscription_store = self._require_subscription_store()
+                subscription_count = len(subscription_store.subscriptions_for_group(group_id))
+                if subscription_count:
+                    changed_count = subscription_store.set_group_media_only(group_id, media_only)
+                    if changed_count:
+                        await asyncio.to_thread(subscription_store.save)
+                        await self._sync_subscription_mirror()
+
+        if not subscription_count:
+            return await self._command_response(
+                False,
+                "当前群还没有订阅推特账号，请先使用 /推特关注 添加订阅。",
+                stream_id,
+            )
+        mode_label = "仅媒体" if media_only else "全部推文"
+        if changed_count:
+            self._wake_event.set()
+            response = (
+                f"已将当前群 {subscription_count} 个订阅统一设置为 [{mode_label}]，"
+                f"其中 {changed_count} 个发生变化。"
+            )
+        else:
+            response = f"当前群 {subscription_count} 个订阅已经全部是 [{mode_label}]。"
         return await self._command_response(True, response, stream_id)
 
     @Command(
@@ -1063,6 +1164,20 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         return accounts
 
     @staticmethod
+    def _parse_follow_request(raw_value: str) -> Tuple[List[str], bool]:
+        """解析关注命令末尾可选的“仅媒体”标记。"""
+
+        values = [
+            value
+            for value in ACCOUNT_SEPARATOR_PATTERN.split(raw_value.strip())
+            if value
+        ]
+        media_only = bool(values and values[-1] == "仅媒体")
+        if media_only:
+            values.pop()
+        return NitterToMaiBotPlugin._parse_accounts(" ".join(values)), media_only
+
+    @staticmethod
     def _find_status_reference(text: str) -> Optional[Tuple[str, str]]:
         """从文本中提取第一条 Twitter/X/Nitter 状态链接。"""
 
@@ -1080,10 +1195,24 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             request_attempts=self.config.nitter.request_attempts,
         )
 
-    def _build_scan_targets(self) -> Dict[str, List[str]]:
+    def _build_scan_targets(self) -> Dict[str, Dict[str, bool]]:
         """从统一订阅存储生成当前启用的扫描与投递目标。"""
 
-        return self._require_subscription_store().target_groups_by_account()
+        return self._require_subscription_store().target_subscriptions_by_account()
+
+    @staticmethod
+    def _eligible_target_groups(
+        post: NitterPost,
+        group_filters: Dict[str, bool],
+    ) -> List[str]:
+        """按推文是否含媒体筛选本次需要投递的目标群。"""
+
+        has_media = post.has_video or bool(post.media)
+        return [
+            group_id
+            for group_id, media_only in group_filters.items()
+            if not media_only or has_media
+        ]
 
     async def _parse_and_send_status(self, account: str, post_id: str, stream_id: str) -> None:
         """从本地 Nitter 状态页读取并发送指定推文。"""
@@ -1451,12 +1580,18 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
 
             if not quiet_active:
                 targets_by_account = {
-                    account.lower(): qq_groups for account, qq_groups in scan_targets.items()
+                    account.lower(): group_filters
+                    for account, group_filters in scan_targets.items()
                 }
                 queue_changed = False
                 for queued_post in state_store.quiet_posts():
-                    qq_groups = targets_by_account.get(queued_post.account.lower())
-                    if qq_groups is None or (
+                    group_filters = targets_by_account.get(queued_post.account.lower())
+                    qq_groups = (
+                        []
+                        if group_filters is None
+                        else self._eligible_target_groups(queued_post, group_filters)
+                    )
+                    if not qq_groups or (
                         queued_post.is_retweet and not self.config.nitter.include_retweets
                     ):
                         state_store.mark_seen(queued_post.account, queued_post.post_id)
@@ -1474,7 +1609,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 if queue_changed:
                     await asyncio.to_thread(state_store.save)
 
-            for account, qq_groups in scan_targets.items():
+            for account, group_filters in scan_targets.items():
                 summary.scanned_accounts += 1
                 try:
                     posts = await client.fetch_timeline(account)
@@ -1511,19 +1646,30 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                         self.ctx.logger.info("已按配置跳过 @%s 的转推 %s", account, post.post_id)
                         continue
                     try:
-                        prepared_post = await self._prepare_post(
+                        media_post = await self._prepare_post_media(
                             client,
                             post,
-                            tolerate_media_errors=False,
+                            tolerate_errors=False,
                         )
                     except Exception:
                         self.ctx.logger.error(
-                            "准备 @%s 的推文 %s 正文或媒体失败",
+                            "准备 @%s 的推文 %s 媒体失败",
                             account,
                             post.post_id,
                             exc_info=True,
                         )
                         continue
+                    qq_groups = self._eligible_target_groups(media_post, group_filters)
+                    if not qq_groups:
+                        state_store.mark_seen(account, post.post_id)
+                        await asyncio.to_thread(state_store.save)
+                        self.ctx.logger.info(
+                            "已按仅媒体订阅设置跳过 @%s 的纯文本推文 %s",
+                            account,
+                            post.post_id,
+                        )
+                        continue
+                    prepared_post = await self._prepare_post_translation(media_post)
                     if quiet_active:
                         state_store.queue_quiet_post(prepared_post)
                     else:

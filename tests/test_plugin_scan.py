@@ -307,6 +307,13 @@ class PluginScanTests(IsolatedAsyncioTestCase):
             )
             plugin._set_context(context)
             await plugin.on_load()
+            self.assertTrue(
+                plugin._require_subscription_store().set_media_only(
+                    "10001",
+                    "example",
+                    True,
+                )
+            )
 
             with patch("plugins.NitterToMaiBot.plugin.NitterClient", _FakeNitterClient):
                 summary = await plugin._scan_once()
@@ -330,6 +337,109 @@ class PluginScanTests(IsolatedAsyncioTestCase):
             "https://video.twimg.com/video.mp4",
         )
         self.assertNotIn("base64", video_call["content"])
+
+    async def test_media_only_subscription_excludes_plain_text_for_its_group(self) -> None:
+        """纯文本推文只投递到全部推文群，不进入仅媒体群。"""
+
+        calls: List[Tuple[str, Dict[str, Any]]] = []
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method
+            del plugin_id
+            del timeout_ms
+            calls.append((str(payload["capability"]), payload))
+            capability = str(payload["capability"])
+            if capability == "chat.open_session":
+                return {"success": True, "stream_id": "qq-group-stream"}
+            if capability == "send.text":
+                return {"success": True}
+            raise AssertionError(f"收到未预期的能力调用: {capability}")
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {
+                    "plugin": {"enabled": False, "config_version": "1.5.3"},
+                    "nitter": {
+                        "base_url": "http://127.0.0.1:8080",
+                        "send_existing_on_first_run": True,
+                    },
+                }
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    rpc_call=rpc_call,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+            subscription_store = plugin._require_subscription_store()
+            subscription_store.subscribe("10001", "first")
+            subscription_store.subscribe("10002", "first", media_only=True)
+
+            with patch("plugins.NitterToMaiBot.plugin.NitterClient", _MultiAccountNitterClient):
+                summary = await plugin._scan_once()
+
+            state_store = plugin._require_state_store()
+            await plugin.on_unload()
+
+        self.assertEqual(summary.forwarded_posts, 1)
+        self.assertTrue(state_store.is_seen("first", "1001"))
+        self.assertEqual(
+            [capability for capability, _payload in calls],
+            ["chat.open_session", "send.text"],
+        )
+        self.assertEqual(calls[0][1]["args"]["group_id"], "10001")
+
+    async def test_media_only_subscription_marks_plain_text_seen_when_no_group_accepts_it(self) -> None:
+        """只有仅媒体目标时，纯文本推文直接记为已处理且不发送。"""
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {
+                    "plugin": {"enabled": False, "config_version": "1.5.3"},
+                    "nitter": {
+                        "base_url": "http://127.0.0.1:8080",
+                        "send_existing_on_first_run": True,
+                    },
+                }
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+            plugin._require_subscription_store().subscribe(
+                "10001",
+                "first",
+                media_only=True,
+            )
+
+            with patch("plugins.NitterToMaiBot.plugin.NitterClient", _MultiAccountNitterClient):
+                summary = await plugin._scan_once()
+
+            state_store = plugin._require_state_store()
+            await plugin.on_unload()
+
+        self.assertEqual(summary.forwarded_posts, 0)
+        self.assertTrue(state_store.is_seen("first", "1001"))
 
     async def test_scan_batches_multiple_accounts_for_same_group(self) -> None:
         """同一轮、同一目标群的多账号更新应合并为一条聊天记录。"""

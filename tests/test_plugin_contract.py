@@ -4,6 +4,7 @@ from pathlib import Path
 from unittest import TestCase
 
 import json
+import re
 
 from plugins.NitterToMaiBot.plugin import (
     DeliverySectionConfig,
@@ -31,6 +32,7 @@ class PluginContractTests(TestCase):
         self.assertIn("nitter_to_maibot_follow", component_names)
         self.assertIn("nitter_to_maibot_unfollow", component_names)
         self.assertIn("nitter_to_maibot_list_follows", component_names)
+        self.assertIn("nitter_to_maibot_set_group_media_only", component_names)
         self.assertIn("nitter_to_maibot_toggle_push", component_names)
         self.assertIn("nitter_to_maibot_posts", component_names)
         self.assertNotIn("nitter_to_maibot_test_account", component_names)
@@ -42,7 +44,21 @@ class PluginContractTests(TestCase):
         help_component = next(
             component for component in components if component["name"] == "nitter_to_maibot_help"
         )
+        list_component = next(
+            component
+            for component in components
+            if component["name"] == "nitter_to_maibot_list_follows"
+        )
+        media_only_component = next(
+            component
+            for component in components
+            if component["name"] == "nitter_to_maibot_set_group_media_only"
+        )
         self.assertIn("twitter_help", help_component["metadata"]["command_pattern"])
+        list_pattern = list_component["metadata"]["command_pattern"]
+        self.assertIsNotNone(re.fullmatch(list_pattern, "/推特订阅查询"))
+        self.assertIsNone(re.fullmatch(list_pattern, "/推特订阅"))
+        self.assertIn("twitter_media_only", media_only_component["metadata"]["command_pattern"])
         self.assertIn("twitter_posts", posts_component["metadata"]["command_pattern"])
         auto_parse_component = next(
             component for component in components if component["name"] == "nitter_to_maibot_auto_parse_status"
@@ -137,6 +153,10 @@ class PluginContractTests(TestCase):
         self.assertTrue(sections["delivery"]["fields"]["qq_groups"]["hidden"])
         self.assertTrue(sections["subscriptions"]["fields"]["groups"]["disabled"])
         self.assertTrue(sections["subscriptions"]["fields"]["accounts"]["disabled"])
+        self.assertIn(
+            "media_only_qq_groups",
+            sections["subscriptions"]["fields"]["accounts"]["item_fields"],
+        )
 
     def test_visible_config_fields_have_chinese_labels_and_explanations(self) -> None:
         schema = create_plugin().build_config_schema()

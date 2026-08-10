@@ -1,14 +1,14 @@
 """QQ 群订阅关系的持久化存储。"""
 
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import json
 import os
 import re
 
 
-SUBSCRIPTION_VERSION = 2
+SUBSCRIPTION_VERSION = 3
 USERNAME_PATTERN = re.compile(r"^[A-Za-z0-9_]{1,15}$")
 
 
@@ -46,9 +46,13 @@ class SubscriptionStore:
             self._load_version_one(raw_state)
             self._needs_save = True
             return
+        if version == 2:
+            self._load_account_mapping(raw_state, include_media_filters=False)
+            self._needs_save = True
+            return
         if version != SUBSCRIPTION_VERSION:
             raise ValueError(f"不支持的 NitterToMaiBot 订阅文件版本: {self.path}")
-        self._load_version_two(raw_state)
+        self._load_account_mapping(raw_state, include_media_filters=True)
 
     def save(self) -> None:
         """以当前版本原子保存订阅关系。"""
@@ -61,7 +65,7 @@ class SubscriptionStore:
         os.replace(temp_path, self.path)
         self._needs_save = False
 
-    def subscribe(self, group_id: str, account: str) -> bool:
+    def subscribe(self, group_id: str, account: str, media_only: bool = False) -> bool:
         """为群添加账号订阅，返回是否实际新增。"""
 
         self._validate_group_id(group_id)
@@ -70,13 +74,44 @@ class SubscriptionStore:
         account_key = account.lower()
         account_entry = self._accounts.setdefault(
             account_key,
-            {"account": account, "display_name": "", "qq_groups": []},
+            {
+                "account": account,
+                "display_name": "",
+                "qq_groups": [],
+                "media_only_qq_groups": [],
+            },
         )
         qq_groups = self._groups_from_account(account_entry)
         if group_id in qq_groups:
             return False
         qq_groups.append(group_id)
+        if media_only:
+            self._media_only_groups_from_account(account_entry).append(group_id)
         return True
+
+    def set_media_only(self, group_id: str, account: str, media_only: bool) -> bool:
+        """修改一条群账号订阅的仅媒体标记，返回标记是否发生变化。"""
+
+        account_entry = self._accounts.get(account.lower())
+        if account_entry is None or group_id not in self._groups_from_account(account_entry):
+            return False
+        media_only_groups = self._media_only_groups_from_account(account_entry)
+        currently_media_only = group_id in media_only_groups
+        if currently_media_only == media_only:
+            return False
+        if media_only:
+            media_only_groups.append(group_id)
+        else:
+            media_only_groups.remove(group_id)
+        return True
+
+    def is_media_only(self, group_id: str, account: str) -> bool:
+        """返回指定群对账号的订阅是否仅接收带媒体的推文。"""
+
+        account_entry = self._accounts.get(account.lower())
+        if account_entry is None or group_id not in self._groups_from_account(account_entry):
+            return False
+        return group_id in self._media_only_groups_from_account(account_entry)
 
     def unsubscribe(self, group_id: str, account: str) -> bool:
         """从群移除账号订阅，并清理没有订阅关系的空记录。"""
@@ -89,6 +124,9 @@ class SubscriptionStore:
         if group_id not in qq_groups:
             return False
         qq_groups.remove(group_id)
+        media_only_groups = self._media_only_groups_from_account(account_entry)
+        if group_id in media_only_groups:
+            media_only_groups.remove(group_id)
         if not qq_groups:
             del self._accounts[account_key]
         if not any(group_id in self._groups_from_account(entry) for entry in self._accounts.values()):
@@ -116,6 +154,28 @@ class SubscriptionStore:
             if group_id in self._groups_from_account(account_entry):
                 accounts.append(self._account_name(account_entry))
         return accounts
+
+    def subscriptions_for_group(self, group_id: str) -> List[Tuple[str, bool]]:
+        """返回群内账号及其仅媒体标记的副本。"""
+
+        subscriptions: List[Tuple[str, bool]] = []
+        for account_entry in self._accounts.values():
+            if group_id not in self._groups_from_account(account_entry):
+                continue
+            account = self._account_name(account_entry)
+            subscriptions.append((account, self.is_media_only(group_id, account)))
+        return subscriptions
+
+    def set_group_media_only(self, group_id: str, media_only: bool) -> int:
+        """批量修改一个群的全部账号订阅模式，返回实际变化数量。"""
+
+        changed_count = 0
+        for account, current_media_only in self.subscriptions_for_group(group_id):
+            if current_media_only == media_only:
+                continue
+            if self.set_media_only(group_id, account, media_only):
+                changed_count += 1
+        return changed_count
 
     def display_name(self, account: str) -> str:
         """返回账号的推特显示名；尚未获取时返回空字符串。"""
@@ -154,6 +214,21 @@ class SubscriptionStore:
                 targets[self._account_name(account_entry)] = enabled_groups
         return targets
 
+    def target_subscriptions_by_account(self) -> Dict[str, Dict[str, bool]]:
+        """按账号汇总已启用目标群及对应的仅媒体标记。"""
+
+        targets: Dict[str, Dict[str, bool]] = {}
+        for account_entry in self._accounts.values():
+            account = self._account_name(account_entry)
+            enabled_groups = {
+                group_id: self.is_media_only(group_id, account)
+                for group_id in self._groups_from_account(account_entry)
+                if self._groups[group_id]
+            }
+            if enabled_groups:
+                targets[account] = enabled_groups
+        return targets
+
     def merge_legacy_global_subscriptions(self, accounts: List[str], group_ids: List[str]) -> bool:
         """把旧配置中的账号与群笛卡尔积合并进统一订阅结构。"""
 
@@ -182,6 +257,9 @@ class SubscriptionStore:
             account_snapshot = {
                 "account": self._account_name(account_entry),
                 "qq_groups": list(self._groups_from_account(account_entry)),
+                "media_only_qq_groups": list(
+                    self._media_only_groups_from_account(account_entry)
+                ),
             }
             display_name = self.display_name(self._account_name(account_entry))
             if display_name:
@@ -224,8 +302,13 @@ class SubscriptionStore:
             self._groups[group_id] = enabled
         self._remove_empty_groups()
 
-    def _load_version_two(self, raw_state: Dict[str, object]) -> None:
-        """读取当前的群列表与账号列表结构。"""
+    def _load_account_mapping(
+        self,
+        raw_state: Dict[str, object],
+        *,
+        include_media_filters: bool,
+    ) -> None:
+        """读取第二、三版的群列表与账号列表结构。"""
 
         raw_groups = raw_state.get("groups")
         raw_accounts = raw_state.get("accounts")
@@ -249,10 +332,14 @@ class SubscriptionStore:
             account = raw_account.get("account")
             display_name = raw_account.get("display_name", "")
             qq_groups = raw_account.get("qq_groups")
+            media_only_qq_groups = (
+                raw_account.get("media_only_qq_groups") if include_media_filters else []
+            )
             if (
                 not isinstance(account, str)
                 or not isinstance(display_name, str)
                 or not isinstance(qq_groups, list)
+                or not isinstance(media_only_qq_groups, list)
             ):
                 raise ValueError(f"NitterToMaiBot 账号订阅字段无效: {self.path}")
             self._validate_account(account)
@@ -262,10 +349,18 @@ class SubscriptionStore:
                 raise ValueError(f"NitterToMaiBot 账号订阅引用了不存在的群: @{account}")
             if len(set(qq_groups)) != len(qq_groups):
                 raise ValueError(f"NitterToMaiBot 账号订阅存在重复群号: @{account}")
+            if not all(
+                isinstance(group_id, str) and group_id in qq_groups
+                for group_id in media_only_qq_groups
+            ):
+                raise ValueError(f"NitterToMaiBot 仅媒体订阅引用了未订阅的群: @{account}")
+            if len(set(media_only_qq_groups)) != len(media_only_qq_groups):
+                raise ValueError(f"NitterToMaiBot 仅媒体订阅存在重复群号: @{account}")
             self._accounts[account.lower()] = {
                 "account": account,
                 "display_name": re.sub(r"\s+", " ", display_name).strip(),
                 "qq_groups": list(qq_groups),
+                "media_only_qq_groups": list(media_only_qq_groups),
             }
         self._remove_empty_groups()
 
@@ -294,6 +389,15 @@ class SubscriptionStore:
         if not isinstance(qq_groups, list) or not all(isinstance(group_id, str) for group_id in qq_groups):
             raise TypeError("账号订阅群必须是字符串列表")
         return qq_groups
+
+    @staticmethod
+    def _media_only_groups_from_account(account_entry: Dict[str, object]) -> List[str]:
+        media_only_qq_groups = account_entry["media_only_qq_groups"]
+        if not isinstance(media_only_qq_groups, list) or not all(
+            isinstance(group_id, str) for group_id in media_only_qq_groups
+        ):
+            raise TypeError("仅媒体订阅群必须是字符串列表")
+        return media_only_qq_groups
 
     @staticmethod
     def _validate_group_id(group_id: str) -> None:

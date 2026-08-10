@@ -18,7 +18,7 @@ class SubscriptionStoreTests(TestCase):
             store = SubscriptionStore(path)
             self.assertTrue(store.subscribe("10001", "OpenAI"))
             self.assertFalse(store.subscribe("10001", "openai"))
-            self.assertTrue(store.subscribe("10002", "openai"))
+            self.assertTrue(store.subscribe("10002", "openai", media_only=True))
             self.assertTrue(store.set_display_name("openai", "OpenAI 官方"))
             store.set_push_enabled("10002", False)
             store.save()
@@ -29,6 +29,11 @@ class SubscriptionStoreTests(TestCase):
             self.assertEqual(loaded.accounts_for_group("10001"), ["OpenAI"])
             self.assertEqual(loaded.display_name("OPENAI"), "OpenAI 官方")
             self.assertEqual(loaded.target_groups_by_account(), {"OpenAI": ["10001"]})
+            self.assertEqual(
+                loaded.target_subscriptions_by_account(),
+                {"OpenAI": {"10001": False}},
+            )
+            self.assertTrue(loaded.is_media_only("10002", "OpenAI"))
             self.assertFalse(loaded.is_push_enabled("10002"))
 
     def test_unsubscribe_is_case_insensitive(self) -> None:
@@ -63,21 +68,93 @@ class SubscriptionStoreTests(TestCase):
             self.assertEqual(
                 store.snapshot(),
                 {
-                    "version": 2,
+                    "version": 3,
                     "groups": [
                         {"group_id": "10001", "enabled": True},
                         {"group_id": "10002", "enabled": False},
                     ],
                     "accounts": [
-                        {"account": "OpenAI", "qq_groups": ["10001", "10002"]},
-                        {"account": "elonmusk", "qq_groups": ["10002"]},
+                        {
+                            "account": "OpenAI",
+                            "qq_groups": ["10001", "10002"],
+                            "media_only_qq_groups": [],
+                        },
+                        {
+                            "account": "elonmusk",
+                            "qq_groups": ["10002"],
+                            "media_only_qq_groups": [],
+                        },
                     ],
                 },
             )
             store.save()
             with path.open("r", encoding="utf-8") as subscription_file:
                 saved = json.load(subscription_file)
-            self.assertEqual(saved["version"], 2)
+            self.assertEqual(saved["version"], 3)
+
+    def test_version_two_is_migrated_with_all_posts_mode(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "subscriptions.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "version": 2,
+                        "groups": [{"group_id": "10001", "enabled": True}],
+                        "accounts": [{"account": "OpenAI", "qq_groups": ["10001"]}],
+                    }
+                ),
+                encoding="utf-8",
+            )
+
+            store = SubscriptionStore(path)
+            store.load()
+
+            self.assertTrue(store.needs_save)
+            self.assertFalse(store.is_media_only("10001", "OpenAI"))
+            self.assertEqual(
+                store.snapshot()["accounts"],
+                [
+                    {
+                        "account": "OpenAI",
+                        "qq_groups": ["10001"],
+                        "media_only_qq_groups": [],
+                    }
+                ],
+            )
+
+    def test_media_only_flag_is_independent_per_group(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = SubscriptionStore(Path(temp_dir) / "subscriptions.json")
+            store.subscribe("10001", "OpenAI", media_only=True)
+            store.subscribe("10002", "OpenAI")
+
+            self.assertEqual(
+                store.subscriptions_for_group("10001"),
+                [("OpenAI", True)],
+            )
+            self.assertEqual(
+                store.target_subscriptions_by_account(),
+                {"OpenAI": {"10001": True, "10002": False}},
+            )
+            self.assertTrue(store.set_media_only("10001", "OpenAI", False))
+            self.assertFalse(store.set_media_only("10001", "OpenAI", False))
+            self.assertFalse(store.is_media_only("10001", "OpenAI"))
+
+    def test_set_group_media_only_changes_every_account(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            store = SubscriptionStore(Path(temp_dir) / "subscriptions.json")
+            store.subscribe("10001", "OpenAI")
+            store.subscribe("10001", "elonmusk", media_only=True)
+            store.subscribe("10002", "OpenAI")
+
+            self.assertEqual(store.set_group_media_only("10001", True), 1)
+            self.assertEqual(
+                store.subscriptions_for_group("10001"),
+                [("OpenAI", True), ("elonmusk", True)],
+            )
+            self.assertFalse(store.is_media_only("10002", "OpenAI"))
+            self.assertEqual(store.set_group_media_only("10001", False), 2)
+            self.assertEqual(store.set_group_media_only("10001", False), 0)
 
     def test_legacy_global_subscriptions_are_merged(self) -> None:
         with TemporaryDirectory() as temp_dir:
