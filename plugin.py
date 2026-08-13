@@ -36,9 +36,12 @@ STATUS_URL_PATTERN = re.compile(
 ACCOUNT_SEPARATOR_PATTERN = re.compile(r"[\s,，]+")
 MESSAGE_TOKEN = "message"
 FORWARD_TOKEN = "forward"
+DROPPED_FORWARD_TOKEN = "forward_dropped"
 BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 OFFICIAL_STATUS_BASE_URL = "https://x.com"
 FOLLOW_LIST_FORWARD_THRESHOLD = 20
+MAX_FORWARD_POSTS_PER_BATCH = 10
+MAX_FORWARD_SPLIT_DEPTH = 3
 HLS_VIDEO_TIMEOUT_SECONDS = 300
 PLUGIN_ID = "github.nero-umu.nitter-to-maibot"
 LEGACY_PLUGIN_ID = "third-party.nitter-to-maibot"
@@ -651,6 +654,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             f"账号 {summary.scanned_accounts} 个，"
             f"读取推文 {summary.fetched_posts} 条，"
             f"完成转发 {summary.forwarded_posts} 条，"
+            f"放弃转发 {summary.dropped_posts} 条，"
             f"静默待发送 {summary.deferred_posts} 条，"
             f"失败账号 {summary.failed_accounts} 个。"
         )
@@ -1367,13 +1371,64 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         *,
         tolerate_media_errors: bool,
     ) -> bool:
-        """把每条推文构造成一个节点，并通过 SDK 发送 QQ 合并转发。"""
+        """把多条预览按节点数和图片体积拆包后发送 QQ 合并转发。"""
 
-        nodes = await self._build_forward_nodes(
-            client,
-            posts,
-            tolerate_media_errors=tolerate_media_errors,
-        )
+        batch_posts: List[NitterPost] = []
+        batch_nodes: List[Dict[str, Any]] = []
+        batch_inline_bytes = 0
+        inline_budget = self.config.delivery.max_media_size_mb * 1024 * 1024
+
+        for post in posts:
+            selected_media = self._select_media(post.media)
+            if any(media.media_type != "image" for media in selected_media):
+                if batch_nodes and not await self._send_forward_nodes(batch_nodes, stream_id):
+                    return False
+                batch_posts = []
+                batch_nodes = []
+                batch_inline_bytes = 0
+                await self._send_post_preview(client, post, stream_id)
+                continue
+
+            node, post_inline_bytes = await self._build_inline_image_forward_node(
+                client,
+                post,
+                tolerate_media_errors=tolerate_media_errors,
+            )
+            if post_inline_bytes > inline_budget:
+                if batch_nodes and not await self._send_forward_nodes(batch_nodes, stream_id):
+                    return False
+                batch_posts = []
+                batch_nodes = []
+                batch_inline_bytes = 0
+                await self._send_post_preview(client, post, stream_id)
+                continue
+
+            should_flush = bool(batch_nodes) and (
+                len(batch_posts) >= MAX_FORWARD_POSTS_PER_BATCH
+                or batch_inline_bytes + post_inline_bytes > inline_budget
+            )
+            if should_flush:
+                if not await self._send_forward_nodes(batch_nodes, stream_id):
+                    return False
+                batch_posts = []
+                batch_nodes = []
+                batch_inline_bytes = 0
+
+            batch_posts.append(post)
+            batch_nodes.append(node)
+            batch_inline_bytes += post_inline_bytes
+
+        if not batch_nodes:
+            return True
+        return await self._send_forward_nodes(batch_nodes, stream_id)
+
+    async def _send_forward_nodes(
+        self,
+        nodes: List[Dict[str, Any]],
+        stream_id: str,
+    ) -> bool:
+        """发送一个已经控制节点数和图片体积的合并转发包。"""
+
         return bool(
             await self.ctx.send.forward(
                 nodes,
@@ -1413,78 +1468,241 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             )
         )
 
-    async def _build_forward_nodes(
+    async def _build_inline_image_forward_node(
+        self,
+        client: NitterClient,
+        post: NitterPost,
+        *,
+        tolerate_media_errors: bool,
+    ) -> Tuple[Dict[str, Any], int]:
+        """构造只包含正文和内嵌图片的合并转发节点。"""
+
+        segments: List[Dict[str, Any]] = [
+            {"type": "text", "content": self._format_post_text(post)}
+        ]
+        inline_bytes = 0
+        per_image_limit = self.config.delivery.max_media_size_mb * 1024 * 1024
+        for media in self._select_media(post.media):
+            if media.media_type != "image":
+                raise ValueError(f"推文 {post.post_id} 含有不能内嵌到合并转发的附件")
+            try:
+                media_data, _content_type = await client.download_media(
+                    media.url,
+                    per_image_limit,
+                )
+            except Exception:
+                if not tolerate_media_errors:
+                    raise
+                self.ctx.logger.warning(
+                    "下载推文 %s 的合并转发图片失败，节点中仅保留图片地址: %s",
+                    post.post_id,
+                    media.url,
+                    exc_info=True,
+                )
+                segments.append({"type": "text", "content": f"\n图片：{media.url}"})
+                continue
+            inline_bytes += len(media_data)
+            segments.append(
+                {
+                    "type": "image",
+                    "content": base64.b64encode(media_data).decode("ascii"),
+                }
+            )
+
+        nickname = post.author if post.author.startswith("@") else f"@{post.author}"
+        return (
+            {
+                "user_id": "0",
+                "nickname": nickname,
+                "message_id": post.post_id,
+                "segments": segments,
+            },
+            inline_bytes,
+        )
+
+    async def _send_posts_to_group_in_batches(
         self,
         client: NitterClient,
         posts: List[NitterPost],
-        *,
-        tolerate_media_errors: bool,
-    ) -> List[Dict[str, Any]]:
-        """构造合并转发节点，并限制单次 RPC 中内嵌图片的总大小。"""
+        group_id: str,
+        stream_id: str,
+    ) -> None:
+        """按顺序分包投递自动扫描结果，并在每包成功后立即保存进度。"""
 
-        nodes: List[Dict[str, Any]] = []
+        batch_posts: List[NitterPost] = []
+        batch_nodes: List[Dict[str, Any]] = []
+        batch_inline_bytes = 0
         inline_budget = self.config.delivery.max_media_size_mb * 1024 * 1024
-        inline_bytes = 0
 
         for post in posts:
-            segments: List[Dict[str, Any]] = [
-                {"type": "text", "content": self._format_post_text(post)}
-            ]
-            for index, media in enumerate(self._select_media(post.media), start=1):
-                content_type = self._media_content_type(media)
-                if media.media_type == "image":
-                    remaining_bytes = inline_budget - inline_bytes
-                    if remaining_bytes > 0:
-                        try:
-                            media_data, content_type = await client.download_media(
-                                media.url,
-                                remaining_bytes,
-                            )
-                        except MediaTooLargeError:
-                            self.ctx.logger.warning(
-                                "合并转发的内嵌图片累计达到 %d MiB，后续图片改用原始 URL 文件节点",
-                                inline_budget // 1024 // 1024,
-                            )
-                        except Exception:
-                            if not tolerate_media_errors:
-                                raise
-                            self.ctx.logger.warning(
-                                "下载推文 %s 的合并转发图片失败，改用原始 URL 文件节点: %s",
-                                post.post_id,
-                                media.url,
-                                exc_info=True,
-                            )
-                        else:
-                            inline_bytes += len(media_data)
-                            segments.append(
-                                {
-                                    "type": "image",
-                                    "content": base64.b64encode(media_data).decode("ascii"),
-                                }
-                            )
-                            continue
+            selected_media = self._select_media(post.media)
+            if any(media.media_type != "image" for media in selected_media):
+                if batch_nodes:
+                    await self._send_forward_batch_to_group(
+                        group_id,
+                        batch_posts,
+                        batch_nodes,
+                        stream_id,
+                    )
+                    batch_posts = []
+                    batch_nodes = []
+                    batch_inline_bytes = 0
+                await self._deliver_post_to_group(client, post, group_id, stream_id)
+                continue
 
-                segments.append(
-                    {
-                        "type": "file",
-                        "data": {
-                            "name": self._build_media_filename(post, media, index, content_type),
-                            "mime_type": content_type,
-                            "url": media.url,
-                        },
-                    }
+            try:
+                node, post_inline_bytes = await self._build_inline_image_forward_node(
+                    client,
+                    post,
+                    tolerate_media_errors=False,
                 )
+            except Exception:
+                if batch_nodes:
+                    await self._send_forward_batch_to_group(
+                        group_id,
+                        batch_posts,
+                        batch_nodes,
+                        stream_id,
+                    )
+                raise
 
-            nickname = post.author if post.author.startswith("@") else f"@{post.author}"
-            nodes.append(
-                {
-                    "user_id": "0",
-                    "nickname": nickname,
-                    "message_id": post.post_id,
-                    "segments": segments,
-                }
+            if post_inline_bytes > inline_budget:
+                if batch_nodes:
+                    await self._send_forward_batch_to_group(
+                        group_id,
+                        batch_posts,
+                        batch_nodes,
+                        stream_id,
+                    )
+                    batch_posts = []
+                    batch_nodes = []
+                    batch_inline_bytes = 0
+                self.ctx.logger.info(
+                    "推文 %s 的图片合计超过 %d MiB，改为逐条发送正文和图片",
+                    post.post_id,
+                    self.config.delivery.max_media_size_mb,
+                )
+                await self._deliver_post_to_group(client, post, group_id, stream_id)
+                continue
+
+            should_flush = bool(batch_nodes) and (
+                len(batch_posts) >= MAX_FORWARD_POSTS_PER_BATCH
+                or batch_inline_bytes + post_inline_bytes > inline_budget
             )
-        return nodes
+            if should_flush:
+                await self._send_forward_batch_to_group(
+                    group_id,
+                    batch_posts,
+                    batch_nodes,
+                    stream_id,
+                )
+                batch_posts = []
+                batch_nodes = []
+                batch_inline_bytes = 0
+
+            batch_posts.append(post)
+            batch_nodes.append(node)
+            batch_inline_bytes += post_inline_bytes
+
+        if batch_nodes:
+            await self._send_forward_batch_to_group(
+                group_id,
+                batch_posts,
+                batch_nodes,
+                stream_id,
+            )
+
+    async def _send_forward_batch_to_group(
+        self,
+        group_id: str,
+        posts: List[NitterPost],
+        nodes: List[Dict[str, Any]],
+        stream_id: str,
+        split_depth: int = 0,
+    ) -> None:
+        """发送一个自动推送分包；失败时最多递归二分三层。"""
+
+        if not posts or len(posts) != len(nodes):
+            raise ValueError("推文分包及合并转发节点必须非空且数量一致")
+
+        try:
+            sent = await self._send_forward_nodes(nodes, stream_id)
+        except Exception:
+            sent = False
+            self.ctx.logger.warning(
+                "向 QQ 群 %s 发送 %d 条推文的合并转发包时出现异常（二分深度 %d）",
+                group_id,
+                len(posts),
+                split_depth,
+                exc_info=True,
+            )
+
+        if not sent:
+            if split_depth < MAX_FORWARD_SPLIT_DEPTH and len(posts) > 1:
+                midpoint = len(posts) // 2
+                self.ctx.logger.warning(
+                    "向 QQ 群 %s 发送 %d 条推文的合并转发包失败，二分为 %d 条和 %d 条重试（第 %d/%d 次）",
+                    group_id,
+                    len(posts),
+                    midpoint,
+                    len(posts) - midpoint,
+                    split_depth + 1,
+                    MAX_FORWARD_SPLIT_DEPTH,
+                )
+                await self._send_forward_batch_to_group(
+                    group_id,
+                    posts[:midpoint],
+                    nodes[:midpoint],
+                    stream_id,
+                    split_depth + 1,
+                )
+                await self._send_forward_batch_to_group(
+                    group_id,
+                    posts[midpoint:],
+                    nodes[midpoint:],
+                    stream_id,
+                    split_depth + 1,
+                )
+                return
+
+            await self._record_dropped_forward_posts(group_id, posts, split_depth)
+            return
+
+        state_store = self._require_state_store()
+        for post in posts:
+            state_store.mark_token_completed(post.account, post.post_id, group_id, FORWARD_TOKEN)
+        await asyncio.to_thread(state_store.save)
+        self.ctx.logger.info(
+            "已向 QQ 群 %s 合并转发一包 %d 条推文",
+            group_id,
+            len(posts),
+        )
+
+    async def _record_dropped_forward_posts(
+        self,
+        group_id: str,
+        posts: List[NitterPost],
+        split_depth: int,
+    ) -> None:
+        """持久化达到二分上限后仍发送失败的推文，避免持续阻塞后续队列。"""
+
+        state_store = self._require_state_store()
+        for post in posts:
+            state_store.mark_token_completed(
+                post.account,
+                post.post_id,
+                group_id,
+                DROPPED_FORWARD_TOKEN,
+            )
+        await asyncio.to_thread(state_store.save)
+        post_labels = "、".join(f"@{post.account}/{post.post_id}" for post in posts)
+        self.ctx.logger.error(
+            "向 QQ 群 %s 发送的合并转发子包在二分深度 %d 后仍失败，已放弃其中 %d 条推文，不再重试：%s",
+            group_id,
+            split_depth,
+            len(posts),
+            post_labels,
+        )
 
     def _start_polling(self) -> None:
         """确保后台轮询任务只启动一次。"""
@@ -1726,19 +1944,15 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 if should_batch:
                     individual_posts = [post for post in incomplete_posts if post not in clean_posts]
                     try:
-                        forward_sent = await self._send_posts_forward(
+                        await self._send_posts_to_group_in_batches(
                             client,
                             clean_posts,
+                            group_id,
                             stream_id,
-                            tolerate_media_errors=False,
                         )
-                        if not forward_sent:
-                            raise RuntimeError(f"向 QQ 群 {group_id} 发送推文合并转发失败")
-                        for post in clean_posts:
-                            await self._record_delivery_token(post, group_id, FORWARD_TOKEN)
                     except Exception:
                         self.ctx.logger.error(
-                            "向 QQ 群 %s 合并转发 %d 条推文失败",
+                            "向 QQ 群 %s 分包投递 %d 条推文时失败；已成功分包不会重试",
                             group_id,
                             len(clean_posts),
                             exc_info=True,
@@ -1758,10 +1972,23 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             for post, qq_groups in pending_deliveries.values():
                 if not all(self._post_group_delivery_completed(post, group_id) for group_id in qq_groups):
                     continue
+                dropped = any(
+                    DROPPED_FORWARD_TOKEN
+                    in state_store.completed_tokens(post.account, post.post_id, group_id)
+                    for group_id in qq_groups
+                )
                 state_store.mark_seen(post.account, post.post_id)
                 await asyncio.to_thread(state_store.save)
-                summary.forwarded_posts += 1
-                self.ctx.logger.info("已转发 @%s 的推文 %s", post.account, post.post_id)
+                if dropped:
+                    summary.dropped_posts += 1
+                    self.ctx.logger.warning(
+                        "已跳过 @%s 的推文 %s，后续扫描不再转发",
+                        post.account,
+                        post.post_id,
+                    )
+                else:
+                    summary.forwarded_posts += 1
+                    self.ctx.logger.info("已转发 @%s 的推文 %s", post.account, post.post_id)
 
             summary.deferred_posts = state_store.quiet_post_count()
             return summary
@@ -1783,7 +2010,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             group_id,
         )
 
-        if FORWARD_TOKEN in completed_tokens:
+        if FORWARD_TOKEN in completed_tokens or DROPPED_FORWARD_TOKEN in completed_tokens:
             return
         if MESSAGE_TOKEN not in completed_tokens:
             message_sent = await self._send_post_message(stream_id, message_text)
@@ -1816,7 +2043,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             post.post_id,
             group_id,
         )
-        if FORWARD_TOKEN in completed_tokens:
+        if FORWARD_TOKEN in completed_tokens or DROPPED_FORWARD_TOKEN in completed_tokens:
             return True
         required_tokens = {MESSAGE_TOKEN}
         required_tokens.update(self._media_token(media) for media in self._select_media(post.media))
