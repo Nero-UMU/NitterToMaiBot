@@ -74,6 +74,25 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
         self.assertEqual([capability for capability, _payload in calls], ["send.text"])
         self.assertEqual(calls[0][1]["args"]["text"], result[1])
 
+    async def test_webui_management_mode_blocks_group_modification_commands(self) -> None:
+        """仅后台模式仍应由命令层明确拦截群内订阅修改。"""
+
+        plugin = create_plugin()
+        plugin.set_plugin_config(
+            {
+                "plugin": {"enabled": False, "config_version": "1.6.1"},
+                "interaction": {"subscription_management_mode": "webui"},
+            }
+        )
+        result = await plugin.handle_unfollow(
+            group_id="10001",
+            platform="qq",
+            matched_groups={"accounts": "OpenAI"},
+        )
+
+        self.assertFalse(result[0])
+        self.assertIn("只能在插件后台管理", result[1])
+
     async def test_auto_parse_supports_private_qq_stream(self) -> None:
         plugin = create_plugin()
         plugin.set_plugin_config(
@@ -339,6 +358,63 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
             {"OpenAI": {"10001": False}, "elonmusk": {"10001": True}},
         )
         self.assertEqual([capability for capability, _payload in calls], ["send.text", "send.text"])
+
+    async def test_follow_rechecks_group_limit_after_timeline_request(self) -> None:
+        """读取时间线期间订阅发生变化时，提交阶段必须重新检查每群上限。"""
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method
+            del plugin_id
+            del payload
+            del timeout_ms
+            return {"success": True}
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {
+                    "plugin": {"enabled": False, "config_version": "1.6.1"},
+                    "interaction": {"max_accounts_per_group": 1},
+                }
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    rpc_call=rpc_call,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+            store = plugin._require_subscription_store()
+            client = _CommandNitterClient("", 1, 1)
+
+            async def fetch_with_concurrent_subscription(account: str) -> List[NitterPost]:
+                store.subscribe("10001", "Other")
+                return await _CommandNitterClient("", 1, 1).fetch_timeline(account)
+
+            client.fetch_timeline = AsyncMock(side_effect=fetch_with_concurrent_subscription)
+            with patch.object(plugin, "_create_client", return_value=client):
+                result = await plugin.handle_follow(
+                    stream_id="qq-group-stream",
+                    group_id="10001",
+                    platform="qq",
+                    matched_groups={"accounts": "OpenAI"},
+                )
+            current_accounts = store.accounts_for_group("10001")
+            await plugin.on_unload()
+
+        self.assertFalse(result[0])
+        self.assertIn("最多可订阅 1 个账号", result[1])
+        self.assertEqual(current_accounts, ["Other"])
 
     async def test_list_follows_uses_forward_above_twenty_accounts(self) -> None:
         """超过 20 个订阅时按每节点 20 个发送带显示名的合并转发。"""

@@ -7,10 +7,18 @@ from typing import Any, Dict, List, Tuple
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import patch
 
+import asyncio
+
 from maibot_sdk.context import PluginContext, PluginPaths
 
+from plugins.NitterToMaiBot.config_mirror import subscription_revision
 from plugins.NitterToMaiBot.models import MediaAttachment, NitterPost
-from plugins.NitterToMaiBot.plugin import PLUGIN_ID, create_plugin
+from plugins.NitterToMaiBot.plugin import (
+    DROPPED_FORWARD_TOKEN,
+    FORWARD_TOKEN,
+    PLUGIN_ID,
+    create_plugin,
+)
 from plugins.NitterToMaiBot.tests.helpers import use_temporary_config_mirror
 
 
@@ -338,6 +346,215 @@ class PluginScanTests(IsolatedAsyncioTestCase):
         )
         self.assertNotIn("base64", video_call["content"])
 
+    async def test_successful_preview_can_sync_summary_to_maisaka_context(self) -> None:
+        """开启上下文同步后，只在推文发送成功后写入文本摘要。"""
+
+        calls: List[Dict[str, Any]] = []
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method
+            del plugin_id
+            del timeout_ms
+            calls.append(payload)
+            return {"success": True}
+
+        post = NitterPost(
+            account="OpenAI",
+            post_id="5001",
+            author="@OpenAI",
+            text="x" * 150,
+            published_at=datetime(2026, 8, 26, 0, 0, tzinfo=timezone.utc),
+            url="https://nitter.net/OpenAI/status/5001",
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {
+                    "plugin": {"enabled": False, "config_version": "1.6.0"},
+                    "context_sync": {
+                        "enabled": True,
+                        "detail_level": "summary",
+                        "summary_text_limit": 100,
+                    },
+                }
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    rpc_call=rpc_call,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+            await plugin._send_post_preview(object(), post, "qq-group-stream")  # type: ignore[arg-type]
+            await plugin.on_unload()
+
+        self.assertEqual(
+            [payload["capability"] for payload in calls],
+            ["send.text", "maisaka.context.append"],
+        )
+        context_args = calls[1]["args"]
+        self.assertEqual(context_args["source_kind"], f"plugin:{PLUGIN_ID}:tweet_forward")
+        self.assertIn("NitterToMaiBot 已成功转发 1 条推文", context_args["visible_text"])
+        self.assertIn("x" * 100 + "…", context_args["visible_text"])
+        self.assertNotIn("x" * 101, context_args["visible_text"])
+        self.assertNotIn("https://x.com/", context_args["visible_text"])
+
+    def test_full_context_contains_translation_and_only_media_counts(self) -> None:
+        """完整上下文保留文本和翻译，但不写入媒体地址或二进制。"""
+
+        plugin = create_plugin()
+        plugin.set_plugin_config(
+            {
+                "plugin": {"enabled": False, "config_version": "1.6.1"},
+                "context_sync": {"enabled": True, "detail_level": "full"},
+            }
+        )
+        post = NitterPost(
+            account="OpenAI",
+            post_id="7001",
+            author="@OpenAI",
+            text="original text",
+            translated_text="中文翻译内容",
+            published_at=datetime(2026, 8, 26, 2, 0, tzinfo=timezone.utc),
+            url="https://nitter.net/OpenAI/status/7001",
+            media=[
+                MediaAttachment("https://example.com/a.jpg", "image", "image/jpeg"),
+                MediaAttachment("https://example.com/b.mp4", "video", "video/mp4"),
+            ],
+        )
+
+        context_text = plugin._format_context_post(post, 1)
+
+        self.assertIn("original text", context_text)
+        self.assertIn("中文翻译内容", context_text)
+        self.assertIn("媒体：图片 1 个、视频 1 个", context_text)
+        self.assertNotIn("https://x.com/", context_text)
+        self.assertNotIn("https://example.com/a.jpg", context_text)
+        self.assertNotIn("https://example.com/b.mp4", context_text)
+
+    async def test_webui_subscription_mode_applies_current_revision_and_rejects_stale_save(
+        self,
+    ) -> None:
+        """后台管理应写回真实存储，并阻止旧页面覆盖较新的订阅。"""
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {"plugin": {"enabled": False, "config_version": "1.6.0"}}
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+
+            empty_revision = subscription_revision(plugin._require_subscription_store().snapshot())
+            plugin.set_plugin_config(
+                {
+                    "plugin": {"enabled": False, "config_version": "1.6.0"},
+                    "interaction": {"subscription_management_mode": "webui"},
+                    "subscriptions": {
+                        "revision": empty_revision,
+                        "groups": [{"group_id": "10001", "enabled": True}],
+                        "accounts": [
+                            {
+                                "account": "@OpenAI",
+                                "qq_groups": ["10001"],
+                                "media_only_qq_groups": ["10001"],
+                            }
+                        ],
+                    },
+                }
+            )
+            await plugin.on_config_update("self", {}, "test-current")
+            store = plugin._require_subscription_store()
+            self.assertEqual(store.subscriptions_for_group("10001"), [("OpenAI", True)])
+
+            plugin.set_plugin_config(
+                {
+                    "plugin": {"enabled": False, "config_version": "1.6.0"},
+                    "interaction": {"subscription_management_mode": "webui"},
+                    "subscriptions": {
+                        "revision": empty_revision,
+                        "groups": [{"group_id": "20002", "enabled": True}],
+                        "accounts": [
+                            {
+                                "account": "Other",
+                                "qq_groups": ["20002"],
+                                "media_only_qq_groups": [],
+                            }
+                        ],
+                    },
+                }
+            )
+            await plugin.on_config_update("self", {}, "test-stale")
+            self.assertEqual(store.subscriptions_for_group("10001"), [("OpenAI", True)])
+            self.assertEqual(store.subscriptions_for_group("20002"), [])
+            await plugin.on_unload()
+
+    async def test_webui_subscription_save_failure_restores_persisted_snapshot(self) -> None:
+        """后台订阅落盘失败时，内存和后台镜像都应恢复为原快照。"""
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {"plugin": {"enabled": False, "config_version": "1.6.1"}}
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+            store = plugin._require_subscription_store()
+            store.subscribe("10001", "OpenAI")
+            await asyncio.to_thread(store.save)
+            await plugin._sync_subscription_mirror()
+            original_snapshot = store.snapshot()
+            original_revision = subscription_revision(original_snapshot)
+
+            plugin.set_plugin_config(
+                {
+                    "plugin": {"enabled": False, "config_version": "1.6.1"},
+                    "interaction": {"subscription_management_mode": "webui"},
+                    "subscriptions": {
+                        "revision": original_revision,
+                        "groups": [{"group_id": "20002", "enabled": True}],
+                        "accounts": [
+                            {"account": "Other", "qq_groups": ["20002"]}
+                        ],
+                    },
+                }
+            )
+            with patch.object(store, "save", side_effect=OSError("测试写入失败")):
+                with self.assertRaises(OSError):
+                    await plugin._apply_subscription_config_update()
+
+            self.assertEqual(store.snapshot(), original_snapshot)
+            await plugin.on_unload()
+
     async def test_media_only_subscription_excludes_plain_text_for_its_group(self) -> None:
         """纯文本推文只投递到全部推文群，不进入仅媒体群。"""
 
@@ -579,3 +796,391 @@ class PluginScanTests(IsolatedAsyncioTestCase):
         )
         forward_messages = calls[1][1]["args"]["messages"]
         self.assertEqual([node["nickname"] for node in forward_messages], ["@first", "@second"])
+
+    async def test_forward_batches_bisect_failure_and_drop_only_failed_leaf(self) -> None:
+        """失败分包应最多二分三层，并只放弃最终仍失败的叶子。"""
+
+        forward_calls: List[Dict[str, Any]] = []
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method
+            del plugin_id
+            del timeout_ms
+            self.assertEqual(payload["capability"], "send.forward")
+            forward_calls.append(payload)
+            post_ids = {
+                str(message["message_id"])
+                for message in payload["args"]["messages"]
+            }
+            return {"success": "3007" not in post_ids}
+
+        posts = [
+            NitterPost(
+                account=f"account{index:02d}",
+                post_id=str(3000 + index),
+                author=f"@account{index:02d}",
+                text=f"第 {index} 条测试推文",
+                published_at=datetime(2026, 8, 11, 0, index, tzinfo=timezone.utc),
+                url=f"http://127.0.0.1:8080/account{index:02d}/status/{3000 + index}",
+            )
+            for index in range(8)
+        ]
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {"plugin": {"enabled": False, "config_version": "1.5.3"}}
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    rpc_call=rpc_call,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+
+            await plugin._send_posts_to_group_in_batches(
+                _MultiAccountNitterClient("", 0, 0),
+                posts,
+                "10001",
+                "qq-group-stream",
+            )
+
+            state_store = plugin._require_state_store()
+            completed_tokens = [
+                state_store.completed_tokens(post.account, post.post_id, "10001")
+                for post in posts
+            ]
+            await plugin.on_unload()
+
+        self.assertEqual(
+            [len(call["args"]["messages"]) for call in forward_calls],
+            [8, 4, 4, 2, 2, 1, 1],
+        )
+        self.assertTrue(all(FORWARD_TOKEN in tokens for tokens in completed_tokens[:7]))
+        self.assertNotIn(FORWARD_TOKEN, completed_tokens[7])
+        self.assertIn(DROPPED_FORWARD_TOKEN, completed_tokens[7])
+
+    async def test_forward_batch_failure_drops_whole_batch_when_split_attempts_is_zero(
+        self,
+    ) -> None:
+        """二分次数为零时，整包首次失败后应直接全部放弃。"""
+
+        forward_calls: List[Dict[str, Any]] = []
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method
+            del plugin_id
+            del timeout_ms
+            forward_calls.append(payload)
+            return {"success": False}
+
+        posts = [
+            NitterPost(
+                account=f"account{index}",
+                post_id=str(5000 + index),
+                author=f"@account{index}",
+                text=f"第 {index} 条失败测试推文",
+                published_at=datetime(2026, 8, 26, 0, index, tzinfo=timezone.utc),
+                url=f"https://nitter.net/account{index}/status/{5000 + index}",
+            )
+            for index in range(4)
+        ]
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {
+                    "plugin": {"enabled": False, "config_version": "1.6.1"},
+                    "delivery": {"forward_split_attempts": 0},
+                    "context_sync": {"enabled": True},
+                }
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    rpc_call=rpc_call,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+            await plugin._send_posts_to_group_in_batches(
+                _MultiAccountNitterClient("", 0, 0),
+                posts,
+                "10001",
+                "qq-group-stream",
+            )
+            state_store = plugin._require_state_store()
+            completed_tokens = [
+                state_store.completed_tokens(post.account, post.post_id, "10001")
+                for post in posts
+            ]
+            await plugin.on_unload()
+
+        self.assertEqual(len(forward_calls), 1)
+        self.assertEqual(len(forward_calls[0]["args"]["messages"]), 4)
+        self.assertEqual(forward_calls[0]["capability"], "send.forward")
+        self.assertTrue(
+            all(DROPPED_FORWARD_TOKEN in tokens for tokens in completed_tokens)
+        )
+        self.assertTrue(all(FORWARD_TOKEN not in tokens for tokens in completed_tokens))
+
+    async def test_forward_batch_failure_splits_only_one_level_when_configured_once(
+        self,
+    ) -> None:
+        """二分次数为一时，只重试两个一级子包，不继续拆成单条。"""
+
+        forward_sizes: List[int] = []
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method
+            del plugin_id
+            del timeout_ms
+            self.assertEqual(payload["capability"], "send.forward")
+            forward_sizes.append(len(payload["args"]["messages"]))
+            return {"success": False}
+
+        posts = [
+            NitterPost(
+                account=f"single{index}",
+                post_id=str(6000 + index),
+                author=f"@single{index}",
+                text=f"第 {index} 条一次二分测试推文",
+                published_at=datetime(2026, 8, 26, 1, index, tzinfo=timezone.utc),
+                url=f"https://nitter.net/single{index}/status/{6000 + index}",
+            )
+            for index in range(4)
+        ]
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {
+                    "plugin": {"enabled": False, "config_version": "1.6.1"},
+                    "delivery": {"forward_split_attempts": 1},
+                }
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    rpc_call=rpc_call,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+            await plugin._send_posts_to_group_in_batches(
+                _MultiAccountNitterClient("", 0, 0),
+                posts,
+                "10001",
+                "qq-group-stream",
+            )
+            state_store = plugin._require_state_store()
+            completed_tokens = [
+                state_store.completed_tokens(post.account, post.post_id, "10001")
+                for post in posts
+            ]
+            await plugin.on_unload()
+
+        self.assertEqual(forward_sizes, [4, 2, 2])
+        self.assertTrue(
+            all(DROPPED_FORWARD_TOKEN in tokens for tokens in completed_tokens)
+        )
+
+    async def test_bisected_forward_syncs_context_only_for_successful_child(self) -> None:
+        """二分后只有成功并保存进度的子包可以进入聊天上下文。"""
+
+        calls: List[Dict[str, Any]] = []
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method
+            del plugin_id
+            del timeout_ms
+            calls.append(payload)
+            if payload["capability"] == "maisaka.context.append":
+                return {"success": True}
+            message_ids = [
+                message["message_id"] for message in payload["args"]["messages"]
+            ]
+            return {"success": message_ids == ["8001"]}
+
+        posts = [
+            NitterPost(
+                account=account,
+                post_id=post_id,
+                author=f"@{account}",
+                text=f"{account} context test",
+                published_at=datetime(2026, 8, 26, 3, index, tzinfo=timezone.utc),
+                url=f"https://nitter.net/{account}/status/{post_id}",
+            )
+            for index, (account, post_id) in enumerate(
+                (("success_account", "8001"), ("failed_account", "8002"))
+            )
+        ]
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {
+                    "plugin": {"enabled": False, "config_version": "1.6.2"},
+                    "delivery": {"forward_split_attempts": 1},
+                    "context_sync": {"enabled": True},
+                }
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    rpc_call=rpc_call,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+            await plugin._send_posts_to_group_in_batches(
+                _MultiAccountNitterClient("", 0, 0),
+                posts,
+                "10001",
+                "qq-group-stream",
+            )
+            state_store = plugin._require_state_store()
+            success_tokens = state_store.completed_tokens(
+                "success_account", "8001", "10001"
+            )
+            failed_tokens = state_store.completed_tokens(
+                "failed_account", "8002", "10001"
+            )
+            await plugin.on_unload()
+
+        self.assertEqual(
+            [payload["capability"] for payload in calls],
+            [
+                "send.forward",
+                "send.forward",
+                "maisaka.context.append",
+                "send.forward",
+            ],
+        )
+        context_text = calls[2]["args"]["visible_text"]
+        self.assertIn("success_account", context_text)
+        self.assertNotIn("failed_account", context_text)
+        self.assertIn(FORWARD_TOKEN, success_tokens)
+        self.assertIn(DROPPED_FORWARD_TOKEN, failed_tokens)
+
+    async def test_forward_batches_split_on_inline_image_budget_without_file_nodes(self) -> None:
+        """累计图片超过单包上限时拆包，且只构造内嵌图片节点。"""
+
+        forward_calls: List[Dict[str, Any]] = []
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method
+            del plugin_id
+            del timeout_ms
+            self.assertEqual(payload["capability"], "send.forward")
+            forward_calls.append(payload)
+            return {"success": True}
+
+        test_case = self
+
+        class SizedImageClient:
+            async def download_media(self, media_url: str, max_bytes: int) -> Tuple[bytes, str]:
+                del media_url
+                test_case.assertEqual(max_bytes, 1024 * 1024)
+                return b"x" * 700_000, "image/jpeg"
+
+        sized_client = SizedImageClient()
+        posts = [
+            NitterPost(
+                account=f"image{index}",
+                post_id=str(4000 + index),
+                author=f"@image{index}",
+                text=f"图片推文 {index}",
+                published_at=datetime(2026, 8, 11, 1, index, tzinfo=timezone.utc),
+                url=f"http://127.0.0.1:8080/image{index}/status/{4000 + index}",
+                media=[
+                    MediaAttachment(
+                        f"http://127.0.0.1:8080/pic/image{index}.jpg",
+                        "image",
+                        "image/jpeg",
+                    )
+                ],
+            )
+            for index in range(3)
+        ]
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {
+                    "plugin": {"enabled": False, "config_version": "1.5.3"},
+                    "delivery": {"max_media_size_mb": 1},
+                }
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    rpc_call=rpc_call,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+            await plugin._send_posts_to_group_in_batches(
+                sized_client,
+                posts,
+                "10001",
+                "qq-group-stream",
+            )
+            await plugin.on_unload()
+
+        self.assertEqual([len(call["args"]["messages"]) for call in forward_calls], [1, 1, 1])
+        segment_types = [
+            segment["type"]
+            for call in forward_calls
+            for node in call["args"]["messages"]
+            for segment in node["segments"]
+        ]
+        self.assertIn("image", segment_types)
+        self.assertNotIn("file", segment_types)

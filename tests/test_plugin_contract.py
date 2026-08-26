@@ -104,6 +104,7 @@ class PluginContractTests(TestCase):
 
         self.assertIn("send.forward", manifest["capabilities"])
         self.assertIn("llm.generate", manifest["capabilities"])
+        self.assertIn("maisaka.context.append", manifest["capabilities"])
         self.assertNotIn("config.get", manifest["capabilities"])
         self.assertEqual(manifest["id"], PLUGIN_ID)
         self.assertEqual(manifest["plugin_type"], "integration")
@@ -128,7 +129,8 @@ class PluginContractTests(TestCase):
         self.assertEqual(config.nitter.base_url, "https://nitter.net")
         self.assertEqual(config.nitter.poll_interval_seconds, 600)
         self.assertEqual(config.delivery.forward_batch_threshold, 1)
-        self.assertEqual(config.plugin.config_version, "1.5.3")
+        self.assertEqual(config.delivery.forward_split_attempts, 3)
+        self.assertEqual(config.plugin.config_version, "1.6.2")
         self.assertFalse(config.translation.enabled)
         self.assertEqual(config.translation.model, "utils")
         self.assertEqual(config.translation.prompt, TRANSLATION_SYSTEM_PROMPT)
@@ -138,6 +140,48 @@ class PluginContractTests(TestCase):
         self.assertEqual(config.quiet_hours.end_time, "06:00")
         self.assertEqual(config.interaction.max_accounts_per_group, 0)
         self.assertTrue(config.interaction.auto_parse_tweet_links)
+        self.assertEqual(config.interaction.subscription_management_mode, "仅群命令")
+        self.assertFalse(config.context_sync.enabled)
+        self.assertEqual(config.context_sync.detail_level, "摘要")
+
+    def test_new_config_ranges_and_section_order(self) -> None:
+        """二分次数范围和聊天上下文分区位置应与后台说明一致。"""
+
+        schema = create_plugin().build_config_schema()
+        sections = schema["sections"]
+        split_field = sections["delivery"]["fields"]["forward_split_attempts"]
+        self.assertEqual(split_field["min"], 0.0)
+        self.assertEqual(split_field["max"], 10.0)
+        self.assertIn("设置为 0", split_field["hint"])
+        self.assertLess(sections["context_sync"]["order"], sections["subscriptions"]["order"])
+        self.assertEqual(
+            sections["interaction"]["fields"]["subscription_management_mode"]["choices"],
+            ["仅群命令", "仅后台", "群命令和后台"],
+        )
+        self.assertEqual(
+            sections["context_sync"]["fields"]["detail_level"]["choices"],
+            ["摘要", "完整文本"],
+        )
+        self.assertIn(
+            "不会删减 QQ 中实际发送的推文",
+            sections["context_sync"]["fields"]["detail_level"]["hint"],
+        )
+        with self.assertRaises(ValueError):
+            NitterToMaiBotConfig.model_validate(
+                {"delivery": {"forward_split_attempts": -1}}
+            )
+        with self.assertRaises(ValueError):
+            NitterToMaiBotConfig.model_validate(
+                {"delivery": {"forward_split_attempts": 11}}
+            )
+        legacy_config = NitterToMaiBotConfig.model_validate(
+            {
+                "interaction": {"subscription_management_mode": "webui"},
+                "context_sync": {"detail_level": "full"},
+            }
+        )
+        self.assertEqual(legacy_config.interaction.subscription_management_mode, "仅后台")
+        self.assertEqual(legacy_config.context_sync.detail_level, "完整文本")
 
     def test_runtime_config_is_ignored(self) -> None:
         gitignore_path = Path(__file__).parents[1] / ".gitignore"
@@ -145,18 +189,54 @@ class PluginContractTests(TestCase):
 
         self.assertIn("/config.toml", ignored_patterns)
 
-    def test_subscription_lists_are_read_only_in_schema(self) -> None:
+    def test_subscription_lists_are_editable_with_read_only_revision(self) -> None:
         schema = create_plugin().build_config_schema()
         sections = schema["sections"]
 
         self.assertTrue(sections["nitter"]["fields"]["accounts"]["hidden"])
         self.assertTrue(sections["delivery"]["fields"]["qq_groups"]["hidden"])
-        self.assertTrue(sections["subscriptions"]["fields"]["groups"]["disabled"])
-        self.assertTrue(sections["subscriptions"]["fields"]["accounts"]["disabled"])
+        self.assertFalse(sections["subscriptions"]["fields"]["groups"]["disabled"])
+        self.assertFalse(sections["subscriptions"]["fields"]["accounts"]["disabled"])
+        self.assertTrue(sections["subscriptions"]["fields"]["revision"]["disabled"])
+        self.assertTrue(sections["subscriptions"]["fields"]["revision"]["hidden"])
         self.assertIn(
             "media_only_qq_groups",
             sections["subscriptions"]["fields"]["accounts"]["item_fields"],
         )
+
+    def test_subscription_config_rejects_orphan_records_and_duplicate_accounts(self) -> None:
+        """后台订阅快照必须保持群和账号之间完整且唯一的引用关系。"""
+
+        with self.assertRaises(ValueError):
+            NitterToMaiBotConfig.model_validate(
+                {
+                    "subscriptions": {
+                        "groups": [{"group_id": "10001", "enabled": True}],
+                        "accounts": [],
+                    }
+                }
+            )
+        with self.assertRaises(ValueError):
+            NitterToMaiBotConfig.model_validate(
+                {
+                    "subscriptions": {
+                        "groups": [{"group_id": "10001", "enabled": True}],
+                        "accounts": [
+                            {"account": "OpenAI", "qq_groups": ["10001"]},
+                            {"account": "openai", "qq_groups": ["10001"]},
+                        ],
+                    }
+                }
+            )
+        with self.assertRaises(ValueError):
+            NitterToMaiBotConfig.model_validate(
+                {
+                    "subscriptions": {
+                        "groups": [],
+                        "accounts": [{"account": "OpenAI", "qq_groups": []}],
+                    }
+                }
+            )
 
     def test_visible_config_fields_have_chinese_labels_and_explanations(self) -> None:
         schema = create_plugin().build_config_schema()

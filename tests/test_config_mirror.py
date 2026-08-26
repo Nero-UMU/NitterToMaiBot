@@ -1,4 +1,4 @@
-"""后台只读订阅镜像测试。"""
+"""后台订阅镜像测试。"""
 
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -6,11 +6,11 @@ from unittest import TestCase
 
 import tomllib
 
-from plugins.NitterToMaiBot.config_mirror import SubscriptionConfigMirror
+from plugins.NitterToMaiBot.config_mirror import SubscriptionConfigMirror, subscription_revision
 
 
 class SubscriptionConfigMirrorTests(TestCase):
-    """验证镜像只替换订阅展示和旧订阅字段。"""
+    """验证镜像只替换订阅管理区和旧订阅字段。"""
 
     def test_sync_preserves_other_settings_and_clears_legacy_fields(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -59,3 +59,7 @@ accounts = []
             self.assertEqual(config["delivery"]["forward_batch_threshold"], 3)
             self.assertEqual(config["subscriptions"]["groups"], snapshot["groups"])
             self.assertEqual(config["subscriptions"]["accounts"], snapshot["accounts"])
+            self.assertEqual(
+                config["subscriptions"]["revision"],
+                subscription_revision(snapshot),
+            )

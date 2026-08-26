@@ -20,11 +20,11 @@ from maibot_sdk import CONFIG_RELOAD_SCOPE_SELF, Command, Field, HookHandler, Ma
 from maibot_sdk.types import HookMode
 from pydantic import field_validator, model_validator
 
-from .config_mirror import SubscriptionConfigMirror
+from .config_mirror import SubscriptionConfigMirror, subscription_revision
 from .models import MediaAttachment, NitterPost, ScanSummary
 from .nitter_client import MediaTooLargeError, NitterClient, NitterClientError
 from .state_store import StateStore
-from .subscription_store import SubscriptionStore
+from .subscription_store import SUBSCRIPTION_VERSION, SubscriptionStore
 
 
 QQ_ID_PATTERN = re.compile(r"^\d+$")
@@ -41,7 +41,6 @@ BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 OFFICIAL_STATUS_BASE_URL = "https://x.com"
 FOLLOW_LIST_FORWARD_THRESHOLD = 20
 MAX_FORWARD_POSTS_PER_BATCH = 10
-MAX_FORWARD_SPLIT_DEPTH = 3
 HLS_VIDEO_TIMEOUT_SECONDS = 300
 PLUGIN_ID = "github.nero-umu.nitter-to-maibot"
 LEGACY_PLUGIN_ID = "third-party.nitter-to-maibot"
@@ -72,6 +71,8 @@ HELP_TEXT = """推特命令帮助
 /twitter_help、/twitter_follow、/twitter_unfollow、/twitter_follows、/twitter_media_only
 /twitter_push、/twitter_posts、/twitter_parse"""
 TranslationModelTask = Literal["utils", "replyer", "planner"]
+SubscriptionManagementMode = Literal["仅群命令", "仅后台", "群命令和后台"]
+ContextDetailLevel = Literal["摘要", "完整文本"]
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -87,7 +88,7 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "启用插件", "hint": "开启后插件会按照下方轮询设置检查订阅账号。"},
     )
     config_version: str = Field(
-        default="1.5.3",
+        default="1.6.2",
         description="用于插件自动升级配置结构，由程序维护。",
         json_schema_extra={"disabled": True, "label": "配置版本", "hint": "只读字段，请勿手动修改。"},
     )
@@ -275,6 +276,16 @@ class DeliverySectionConfig(PluginConfigBase):
         description="同一轮向同一个群发送的推文数量超过该值时，改用一条 QQ 合并转发消息。",
         json_schema_extra={"label": "合并转发阈值", "hint": "默认 1，表示 1 条普通发送，2 条及以上打包。"},
     )
+    forward_split_attempts: int = Field(
+        default=3,
+        ge=0,
+        le=10,
+        description="自动推送的合并转发包发送失败后，允许递归二分重试的最大层数。",
+        json_schema_extra={
+            "label": "发送失败二分次数",
+            "hint": "默认 3；设置为 0 时整包首次发送失败便全部放弃，设置为 1 时最多拆成两个子包各重试一次，以此类推。",
+        },
+    )
     max_media_size_mb: int = Field(
         default=10,
         ge=1,
@@ -375,10 +386,34 @@ class InteractionSectionConfig(PluginConfigBase):
     __ui_icon__ = "message-circle"
     __ui_order__ = 5
 
+    subscription_management_mode: SubscriptionManagementMode = Field(
+        default="仅群命令",
+        description="决定订阅关系可以通过群命令、后台配置或两者共同管理。",
+        json_schema_extra={
+            "label": "订阅管理方式",
+            "hint": "可选择只允许群命令修改、只允许后台修改，或同时允许两种方式。",
+        },
+    )
+
+    @field_validator("subscription_management_mode", mode="before")
+    @classmethod
+    def normalize_subscription_management_mode(cls, value: object) -> object:
+        """兼容 1.6.0、1.6.1 中使用的英文管理方式值。"""
+
+        legacy_values = {
+            "group_commands": "仅群命令",
+            "webui": "仅后台",
+            "both": "群命令和后台",
+        }
+        return legacy_values.get(value, value) if isinstance(value, str) else value
+
     allow_group_commands: bool = Field(
         default=True,
-        description="是否允许在 QQ 群内使用关注、取关、订阅列表和推送开关命令。",
-        json_schema_extra={"label": "允许群内管理订阅", "hint": "关闭后群成员不能修改订阅，但已有自动推送不受影响。"},
+        description="在“仅群命令”管理方式下，是否允许使用会修改订阅的群命令。",
+        json_schema_extra={
+            "label": "群订阅命令总开关",
+            "hint": "仅对“仅群命令”模式生效；关闭后不能通过群命令修改订阅，查询和已有自动推送不受影响。",
+        },
     )
     command_only_local_operator: bool = Field(
         default=False,
@@ -403,48 +438,168 @@ class InteractionSectionConfig(PluginConfigBase):
 
 
 class SubscriptionGroupViewConfig(PluginConfigBase):
-    """后台只读展示的一条 QQ 群记录。"""
+    """后台展示或编辑的一条 QQ 群记录。"""
 
     group_id: str = Field(default="", description="订阅推特消息的 QQ 群号")
     enabled: bool = Field(default=True, description="该群是否启用推送")
 
+    @field_validator("group_id")
+    @classmethod
+    def validate_group_id(cls, value: str) -> str:
+        """后台保存时只接受纯数字 QQ 群号。"""
+
+        group_id = value.strip()
+        if not QQ_ID_PATTERN.fullmatch(group_id):
+            raise ValueError("订阅群号必须是纯数字")
+        return group_id
+
 
 class SubscriptionAccountViewConfig(PluginConfigBase):
-    """后台只读展示的一条推特账号记录。"""
+    """后台展示或编辑的一条推特账号记录。"""
 
     account: str = Field(default="", description="推特账号 @ID")
-    display_name: str = Field(default="", description="推特账号当前显示名")
-    qq_groups: List[str] = Field(default_factory=list, description="订阅该账号的 QQ 群号")
+    display_name: str = Field(
+        default="",
+        description="推特账号当前显示名，由扫描结果自动维护",
+        json_schema_extra={"disabled": True, "label": "推特显示名称"},
+    )
+    qq_groups: List[str] = Field(
+        default_factory=list,
+        min_length=1,
+        description="订阅该账号的 QQ 群号",
+    )
     media_only_qq_groups: List[str] = Field(
         default_factory=list,
         description="仅接收该账号带媒体推文的 QQ 群号",
     )
 
+    @field_validator("account")
+    @classmethod
+    def validate_account(cls, value: str) -> str:
+        """规范化后台填写的推特账号 ID。"""
+
+        account = value.strip().lstrip("@")
+        if not USERNAME_PATTERN.fullmatch(account):
+            raise ValueError("推特账号必须是 1～15 位字母、数字或下划线")
+        return account
+
+    @field_validator("qq_groups", "media_only_qq_groups")
+    @classmethod
+    def validate_group_ids(cls, values: List[str]) -> List[str]:
+        """规范化账号记录中的群号并拒绝重复项。"""
+
+        group_ids = [value.strip() for value in values]
+        if not all(QQ_ID_PATTERN.fullmatch(group_id) for group_id in group_ids):
+            raise ValueError("账号订阅群号必须是纯数字")
+        if len(set(group_ids)) != len(group_ids):
+            raise ValueError("账号订阅群号不能重复")
+        return group_ids
+
+    @model_validator(mode="after")
+    def validate_media_only_groups(self) -> "SubscriptionAccountViewConfig":
+        """仅媒体群必须同时存在于该账号的普通订阅群列表中。"""
+
+        if not set(self.media_only_qq_groups).issubset(self.qq_groups):
+            raise ValueError("仅媒体群号必须同时属于该账号的订阅群号")
+        return self
+
 
 class SubscriptionViewSectionConfig(PluginConfigBase):
-    """由 subscriptions.json 自动生成的后台只读镜像。"""
+    """由 subscriptions.json 同步的后台订阅管理区。"""
 
-    __ui_label__ = "订阅列表（只读）"
+    __ui_label__ = "订阅列表"
     __ui_icon__ = "list-tree"
-    __ui_order__ = 6
+    __ui_order__ = 7
 
+    revision: str = Field(
+        default="",
+        description="用于检测后台页面是否基于过期订阅数据保存",
+        json_schema_extra={"disabled": True, "hidden": True},
+    )
     groups: List[SubscriptionGroupViewConfig] = Field(
         default_factory=list,
-        description="已订阅推特消息的 QQ 群；请使用群内命令修改",
+        description="已订阅推特消息的 QQ 群及推送开关",
         json_schema_extra={
-            "disabled": True,
-            "hint": "只读展示；enabled 表示该群当前是否允许自动推送。",
+            "hint": "仅后台或混合管理模式下可以保存修改；群号必须同时被至少一个账号引用。",
             "label": "订阅群列表",
         },
     )
     accounts: List[SubscriptionAccountViewConfig] = Field(
         default_factory=list,
-        description="推特账号及订阅该账号的 QQ 群；请使用群内命令修改",
+        description="推特账号及订阅该账号的 QQ 群",
         json_schema_extra={
-            "disabled": True,
-            "hint": "只读展示；仅媒体群号是订阅群号的子集，这些群不会接收该账号的纯文本推文。",
+            "hint": "qq_groups 中的群必须存在于订阅群列表；仅媒体群号必须同时属于 qq_groups。",
             "label": "账号订阅列表",
         },
+    )
+
+    @model_validator(mode="after")
+    def validate_subscription_relationships(self) -> "SubscriptionViewSectionConfig":
+        """确保后台完整快照中的群和账号形成有效的多对多关系。"""
+
+        group_ids = [group.group_id for group in self.groups]
+        if len(set(group_ids)) != len(group_ids):
+            raise ValueError("订阅群列表不能包含重复群号")
+
+        account_keys = [account.account.lower() for account in self.accounts]
+        if len(set(account_keys)) != len(account_keys):
+            raise ValueError("账号订阅列表不能包含重复账号")
+
+        declared_groups = set(group_ids)
+        referenced_groups: Set[str] = set()
+        for account in self.accounts:
+            missing_groups = set(account.qq_groups) - declared_groups
+            if missing_groups:
+                missing_labels = "、".join(sorted(missing_groups))
+                raise ValueError(
+                    f"账号 @{account.account} 引用了订阅群列表中不存在的群号：{missing_labels}"
+                )
+            referenced_groups.update(account.qq_groups)
+
+        unreferenced_groups = declared_groups - referenced_groups
+        if unreferenced_groups:
+            group_labels = "、".join(sorted(unreferenced_groups))
+            raise ValueError(f"以下订阅群没有被任何账号引用：{group_labels}")
+        return self
+
+
+class ContextSyncSectionConfig(PluginConfigBase):
+    """成功转发推文与 Maisaka 聊天上下文的同步设置。"""
+
+    __ui_label__ = "聊天上下文同步"
+    __ui_icon__ = "brain"
+    __ui_order__ = 6
+
+    enabled: bool = Field(
+        default=False,
+        description="成功发送推文后，是否把一条文本记录加入对应聊天流的 Maisaka 上下文。",
+        json_schema_extra={
+            "label": "让机器人知道已转发推文",
+            "hint": "默认关闭；开启后模型可以理解近期由插件转发的内容，但也可能增加上下文消耗或触发模型内容风控。",
+        },
+    )
+    detail_level: ContextDetailLevel = Field(
+        default="摘要",
+        description="控制写入聊天上下文的推文正文详细程度。",
+        json_schema_extra={
+            "label": "上下文详细程度",
+            "hint": "“摘要”只向机器人提供每条推文正文的前若干字符；“完整文本”提供完整原文及已有翻译。此设置只影响机器人读取的聊天上下文，不会删减 QQ 中实际发送的推文；图片和视频本体不会写入上下文，只记录媒体数量。",
+        },
+    )
+
+    @field_validator("detail_level", mode="before")
+    @classmethod
+    def normalize_detail_level(cls, value: object) -> object:
+        """兼容 1.6.0、1.6.1 中使用的英文上下文详细程度。"""
+
+        legacy_values = {"summary": "摘要", "full": "完整文本"}
+        return legacy_values.get(value, value) if isinstance(value, str) else value
+    summary_text_limit: int = Field(
+        default=500,
+        ge=100,
+        le=5000,
+        description="摘要模式下，每条推文正文写入聊天上下文的最大字符数。",
+        json_schema_extra={"label": "摘要正文上限", "hint": "默认 500 个字符，仅影响模型上下文，不改变 QQ 中实际发送的内容。"},
     )
 
 
@@ -458,6 +613,7 @@ class NitterToMaiBotConfig(PluginConfigBase):
     quiet_hours: QuietHoursSectionConfig = Field(default_factory=QuietHoursSectionConfig)
     interaction: InteractionSectionConfig = Field(default_factory=InteractionSectionConfig)
     subscriptions: SubscriptionViewSectionConfig = Field(default_factory=SubscriptionViewSectionConfig)
+    context_sync: ContextSyncSectionConfig = Field(default_factory=ContextSyncSectionConfig)
 
 
 class NitterToMaiBotPlugin(MaiBotPlugin):
@@ -569,8 +725,9 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             return
 
         if self._subscription_store is not None:
-            async with self._subscription_lock:
-                await self._sync_subscription_mirror()
+            async with self._scan_lock:
+                async with self._subscription_lock:
+                    await self._apply_subscription_config_update()
         if self._state_store is not None:
             self._state_store.max_seen_per_account = self.config.nitter.max_seen_posts_per_account
         if self.config.plugin.enabled:
@@ -627,6 +784,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             f"静默时段：{quiet_hours_status}\n"
             f"图片下载上限：{self.config.delivery.max_media_size_mb} MiB\n"
             f"合并转发阈值：超过 {self.config.delivery.forward_batch_threshold} 条\n"
+            f"发送失败二分次数：{self.config.delivery.forward_split_attempts} 次\n"
             f"轮询间隔：{self.config.nitter.poll_interval_seconds} 秒"
         )
         if stream_id:
@@ -738,38 +896,56 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
 
         added_count = 0
         updated_count = 0
+        commit_limit_error = ""
         if fetched_timelines or mode_updates:
             async with self._scan_lock:
                 async with self._subscription_lock:
                     state_store = self._require_state_store()
-                    for account in mode_updates:
-                        if subscription_store.set_media_only(group_id, account, media_only):
-                            updated_count += 1
-                            result_by_account[account.lower()] = (
-                                f"✓ 已将当前群的 @{account} 设置为 [{mode_label}]"
-                            )
-                    for account, posts in fetched_timelines.items():
-                        if subscription_store.subscribe(group_id, account, media_only=media_only):
-                            added_count += 1
-                            result_by_account[account.lower()] = (
-                                f"✓ 已为当前群订阅 @{account} [{mode_label}]"
-                            )
-                        elif subscription_store.set_media_only(group_id, account, media_only):
-                            updated_count += 1
-                            result_by_account[account.lower()] = (
-                                f"✓ 已将当前群的 @{account} 设置为 [{mode_label}]"
-                            )
-                        profile_name = fetched_profile_names.get(account, "")
-                        if profile_name:
-                            subscription_store.set_display_name(account, profile_name)
-                        if not state_store.has_account(account):
-                            baseline = []
-                            if not self.config.nitter.send_existing_on_first_run:
-                                baseline = list(reversed([post.post_id for post in posts]))
-                            state_store.mark_baseline(account, baseline)
-                    await asyncio.to_thread(subscription_store.save)
-                    await asyncio.to_thread(state_store.save)
-                    await self._sync_subscription_mirror()
+                    latest_account_keys = {
+                        account.lower()
+                        for account in subscription_store.accounts_for_group(group_id)
+                    }
+                    latest_new_count = sum(
+                        account.lower() not in latest_account_keys
+                        for account in fetched_timelines
+                    )
+                    if (
+                        account_limit > 0
+                        and len(latest_account_keys) + latest_new_count > account_limit
+                    ):
+                        commit_limit_error = f"当前群最多可订阅 {account_limit} 个账号。"
+                    else:
+                        for account in mode_updates:
+                            if subscription_store.set_media_only(group_id, account, media_only):
+                                updated_count += 1
+                                result_by_account[account.lower()] = (
+                                    f"✓ 已将当前群的 @{account} 设置为 [{mode_label}]"
+                                )
+                        for account, posts in fetched_timelines.items():
+                            if subscription_store.subscribe(group_id, account, media_only=media_only):
+                                added_count += 1
+                                result_by_account[account.lower()] = (
+                                    f"✓ 已为当前群订阅 @{account} [{mode_label}]"
+                                )
+                            elif subscription_store.set_media_only(group_id, account, media_only):
+                                updated_count += 1
+                                result_by_account[account.lower()] = (
+                                    f"✓ 已将当前群的 @{account} 设置为 [{mode_label}]"
+                                )
+                            profile_name = fetched_profile_names.get(account, "")
+                            if profile_name:
+                                subscription_store.set_display_name(account, profile_name)
+                            if not state_store.has_account(account):
+                                baseline = []
+                                if not self.config.nitter.send_existing_on_first_run:
+                                    baseline = list(reversed([post.post_id for post in posts]))
+                                state_store.mark_baseline(account, baseline)
+                        await asyncio.to_thread(subscription_store.save)
+                        await asyncio.to_thread(state_store.save)
+                        await self._sync_subscription_mirror()
+
+        if commit_limit_error:
+            return await self._command_response(False, commit_limit_error, stream_id)
 
         for account in accounts:
             account_key = account.lower()
@@ -827,15 +1003,16 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         subscription_store = self._require_subscription_store()
         removed_accounts: List[str] = []
         missing_accounts: List[str] = []
-        async with self._subscription_lock:
-            for account in accounts:
-                if subscription_store.unsubscribe(group_id, account):
-                    removed_accounts.append(account)
-                else:
-                    missing_accounts.append(account)
-            if removed_accounts:
-                await asyncio.to_thread(subscription_store.save)
-                await self._sync_subscription_mirror()
+        async with self._scan_lock:
+            async with self._subscription_lock:
+                for account in accounts:
+                    if subscription_store.unsubscribe(group_id, account):
+                        removed_accounts.append(account)
+                    else:
+                        missing_accounts.append(account)
+                if removed_accounts:
+                    await asyncio.to_thread(subscription_store.save)
+                    await self._sync_subscription_mirror()
 
         lines = [f"已从当前群取关 @{account}" for account in removed_accounts]
         lines.extend(f"当前群未订阅 @{account}" for account in missing_accounts)
@@ -978,15 +1155,19 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             )
         enabled = raw_status in {"开启", "on"}
         subscription_store = self._require_subscription_store()
-        async with self._subscription_lock:
-            if not subscription_store.set_push_enabled(group_id, enabled):
-                return await self._command_response(
-                    False,
-                    "当前群还没有订阅推特账号，请先使用 /推特关注 添加订阅。",
-                    stream_id,
-                )
-            await asyncio.to_thread(subscription_store.save)
-            await self._sync_subscription_mirror()
+        group_exists = False
+        async with self._scan_lock:
+            async with self._subscription_lock:
+                group_exists = subscription_store.set_push_enabled(group_id, enabled)
+                if group_exists:
+                    await asyncio.to_thread(subscription_store.save)
+                    await self._sync_subscription_mirror()
+        if not group_exists:
+            return await self._command_response(
+                False,
+                "当前群还没有订阅推特账号，请先使用 /推特关注 添加订阅。",
+                stream_id,
+            )
         if enabled:
             self._wake_event.set()
         response = f"当前群的动态推特推送已{'开启' if enabled else '关闭'}。"
@@ -1143,7 +1324,10 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
 
         if platform.lower() != "qq" or not group_id:
             return "该命令只能在 QQ 群聊中使用。"
-        if not self.config.interaction.allow_group_commands:
+        management_mode = self.config.interaction.subscription_management_mode
+        if management_mode == "仅后台":
+            return "当前订阅只能在插件后台管理，群内修改命令已关闭。"
+        if management_mode == "仅群命令" and not self.config.interaction.allow_group_commands:
             return "群内订阅管理已由插件配置关闭。"
         if self.config.interaction.command_only_local_operator and not is_local_operator:
             return "该命令仅允许 MaiBot 本地操作员执行。"
@@ -1258,6 +1442,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                     post.post_id,
                     media.url,
                 )
+        await self._sync_posts_to_context([post], stream_id)
 
     async def _send_posts_preview(
         self,
@@ -1381,7 +1566,11 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         for post in posts:
             selected_media = self._select_media(post.media)
             if any(media.media_type != "image" for media in selected_media):
-                if batch_nodes and not await self._send_forward_nodes(batch_nodes, stream_id):
+                if batch_nodes and not await self._send_forward_nodes(
+                    batch_nodes,
+                    stream_id,
+                    context_posts=batch_posts,
+                ):
                     return False
                 batch_posts = []
                 batch_nodes = []
@@ -1395,7 +1584,11 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 tolerate_media_errors=tolerate_media_errors,
             )
             if post_inline_bytes > inline_budget:
-                if batch_nodes and not await self._send_forward_nodes(batch_nodes, stream_id):
+                if batch_nodes and not await self._send_forward_nodes(
+                    batch_nodes,
+                    stream_id,
+                    context_posts=batch_posts,
+                ):
                     return False
                 batch_posts = []
                 batch_nodes = []
@@ -1408,7 +1601,11 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 or batch_inline_bytes + post_inline_bytes > inline_budget
             )
             if should_flush:
-                if not await self._send_forward_nodes(batch_nodes, stream_id):
+                if not await self._send_forward_nodes(
+                    batch_nodes,
+                    stream_id,
+                    context_posts=batch_posts,
+                ):
                     return False
                 batch_posts = []
                 batch_nodes = []
@@ -1420,16 +1617,22 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
 
         if not batch_nodes:
             return True
-        return await self._send_forward_nodes(batch_nodes, stream_id)
+        return await self._send_forward_nodes(
+            batch_nodes,
+            stream_id,
+            context_posts=batch_posts,
+        )
 
     async def _send_forward_nodes(
         self,
         nodes: List[Dict[str, Any]],
         stream_id: str,
+        *,
+        context_posts: Optional[List[NitterPost]] = None,
     ) -> bool:
         """发送一个已经控制节点数和图片体积的合并转发包。"""
 
-        return bool(
+        sent = bool(
             await self.ctx.send.forward(
                 nodes,
                 stream_id,
@@ -1437,6 +1640,9 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 timeout_ms=120000,
             )
         )
+        if sent and context_posts:
+            await self._sync_posts_to_context(context_posts, stream_id)
+        return sent
 
     async def _send_follow_list_forward(
         self,
@@ -1619,14 +1825,20 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         nodes: List[Dict[str, Any]],
         stream_id: str,
         split_depth: int = 0,
+        max_split_attempts: Optional[int] = None,
     ) -> None:
-        """发送一个自动推送分包；失败时最多递归二分三层。"""
+        """发送一个自动推送分包；失败时按配置的层数递归二分。"""
 
         if not posts or len(posts) != len(nodes):
             raise ValueError("推文分包及合并转发节点必须非空且数量一致")
+        if max_split_attempts is None:
+            max_split_attempts = self.config.delivery.forward_split_attempts
 
         try:
-            sent = await self._send_forward_nodes(nodes, stream_id)
+            sent = await self._send_forward_nodes(
+                nodes,
+                stream_id,
+            )
         except Exception:
             sent = False
             self.ctx.logger.warning(
@@ -1638,7 +1850,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             )
 
         if not sent:
-            if split_depth < MAX_FORWARD_SPLIT_DEPTH and len(posts) > 1:
+            if split_depth < max_split_attempts and len(posts) > 1:
                 midpoint = len(posts) // 2
                 self.ctx.logger.warning(
                     "向 QQ 群 %s 发送 %d 条推文的合并转发包失败，二分为 %d 条和 %d 条重试（第 %d/%d 次）",
@@ -1647,7 +1859,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                     midpoint,
                     len(posts) - midpoint,
                     split_depth + 1,
-                    MAX_FORWARD_SPLIT_DEPTH,
+                    max_split_attempts,
                 )
                 await self._send_forward_batch_to_group(
                     group_id,
@@ -1655,6 +1867,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                     nodes[:midpoint],
                     stream_id,
                     split_depth + 1,
+                    max_split_attempts,
                 )
                 await self._send_forward_batch_to_group(
                     group_id,
@@ -1662,16 +1875,23 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                     nodes[midpoint:],
                     stream_id,
                     split_depth + 1,
+                    max_split_attempts,
                 )
                 return
 
-            await self._record_dropped_forward_posts(group_id, posts, split_depth)
+            await self._record_dropped_forward_posts(
+                group_id,
+                posts,
+                split_depth,
+                max_split_attempts,
+            )
             return
 
         state_store = self._require_state_store()
         for post in posts:
             state_store.mark_token_completed(post.account, post.post_id, group_id, FORWARD_TOKEN)
         await asyncio.to_thread(state_store.save)
+        await self._sync_posts_to_context(posts, stream_id)
         self.ctx.logger.info(
             "已向 QQ 群 %s 合并转发一包 %d 条推文",
             group_id,
@@ -1683,8 +1903,9 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         group_id: str,
         posts: List[NitterPost],
         split_depth: int,
+        max_split_attempts: int,
     ) -> None:
-        """持久化达到二分上限后仍发送失败的推文，避免持续阻塞后续队列。"""
+        """持久化不再二分且仍发送失败的推文，避免持续阻塞后续队列。"""
 
         state_store = self._require_state_store()
         for post in posts:
@@ -1697,9 +1918,10 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         await asyncio.to_thread(state_store.save)
         post_labels = "、".join(f"@{post.account}/{post.post_id}" for post in posts)
         self.ctx.logger.error(
-            "向 QQ 群 %s 发送的合并转发子包在二分深度 %d 后仍失败，已放弃其中 %d 条推文，不再重试：%s",
+            "向 QQ 群 %s 发送的合并转发包失败（已二分 %d 次，配置上限 %d 次），已放弃其中 %d 条推文，不再重试：%s",
             group_id,
             split_depth,
+            max_split_attempts,
             len(posts),
             post_labels,
         )
@@ -2034,6 +2256,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 raise RuntimeError(f"向 QQ 群 {group_id} 发送推文附件失败: {media.url}")
             await self._record_delivery_token(post, group_id, media_token)
             completed_tokens.add(media_token)
+        await self._sync_posts_to_context([post], stream_id)
 
     def _post_group_delivery_completed(self, post: NitterPost, group_id: str) -> bool:
         """判断推文在目标群中是否已经完整发送。"""
@@ -2253,16 +2476,86 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             or "application/octet-stream"
         )
 
+    def _format_context_post(self, post: NitterPost, index: int) -> str:
+        """生成供 Maisaka 理解的单条成功转发记录，不包含媒体二进制。"""
+
+        if self.config.context_sync.detail_level == "完整文本":
+            body = self._format_post_text(post, include_source_link=False)
+        else:
+            text = post.text.strip()
+            text_limit = self.config.context_sync.summary_text_limit
+            if len(text) > text_limit:
+                text = f"{text[:text_limit]}…"
+            beijing_time = post.published_at.astimezone(BEIJING_TIMEZONE).strftime(
+                "%Y-%m-%d %H:%M"
+            )
+            author = post.author if post.author.startswith("@") else f"@{post.author}"
+            action = "转推" if post.is_retweet else "推文"
+            body = (
+                f"@{post.account} 的{action} · {beijing_time}（北京时间）\n"
+                f"作者：{author}\n{text}"
+            )
+
+        selected_media = self._select_media(post.media)
+        media_counts: Dict[str, int] = {}
+        for media in selected_media:
+            media_counts[media.media_type] = media_counts.get(media.media_type, 0) + 1
+        media_labels = []
+        for media_type, label in (("image", "图片"), ("video", "视频"), ("file", "文件")):
+            count = media_counts.get(media_type, 0)
+            if count:
+                media_labels.append(f"{label} {count} 个")
+        if media_labels:
+            body = f"{body}\n媒体：{'、'.join(media_labels)}"
+        return f"{index}. {body}"
+
+    async def _sync_posts_to_context(
+        self,
+        posts: List[NitterPost],
+        stream_id: str,
+    ) -> None:
+        """把已成功发送的推文记录追加到 Maisaka 上下文；失败不影响实际投递。"""
+
+        if not self.config.context_sync.enabled or not posts:
+            return
+        context_text = "\n\n".join(
+            [
+                f"[NitterToMaiBot 已成功转发 {len(posts)} 条推文]",
+                *(self._format_context_post(post, index) for index, post in enumerate(posts, 1)),
+            ]
+        )
+        try:
+            result = await self.ctx.maisaka.context.append(
+                stream_id,
+                [{"type": "text", "content": context_text}],
+                visible_text=context_text,
+                source_kind=f"plugin:{PLUGIN_ID}:tweet_forward",
+            )
+        except Exception:
+            self.ctx.logger.warning(
+                "同步 %d 条已转发推文到 Maisaka 上下文时出现异常",
+                len(posts),
+                exc_info=True,
+            )
+            return
+        if not isinstance(result, dict) or not result.get("success"):
+            error = result.get("error", "未知错误") if isinstance(result, dict) else str(result)
+            self.ctx.logger.warning(
+                "同步 %d 条已转发推文到 Maisaka 上下文失败：%s",
+                len(posts),
+                error,
+            )
+
     @staticmethod
-    def _format_post_text(post: NitterPost) -> str:
-        """生成发送到群中的简体中文推文正文。"""
+    def _format_post_text(
+        post: NitterPost,
+        *,
+        include_source_link: bool = True,
+    ) -> str:
+        """生成推文正文；QQ 消息默认附带原文链接，上下文同步时可省略。"""
 
         beijing_time = post.published_at.astimezone(BEIJING_TIMEZONE).strftime("%Y-%m-%d %H:%M")
         author = post.author if post.author.startswith("@") else f"@{post.author}"
-        source_account = author.lstrip("@")
-        if not USERNAME_PATTERN.fullmatch(source_account):
-            source_account = post.account
-        source_url = f"{OFFICIAL_STATUS_BASE_URL}/{source_account}/status/{post.post_id}"
         if post.is_retweet:
             headline = f"@{post.account} 转推了 {author} · {beijing_time}（北京时间）"
         else:
@@ -2272,7 +2565,12 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             lines.extend(["", "中文翻译：", post.translated_text])
         if post.has_video and not any(media.media_type == "video" for media in post.media):
             lines.extend(["", "媒体提示：原推文包含视频，当前 Nitter 实例未提供可下载地址"])
-        lines.extend(["", f"原文：{source_url}"])
+        if include_source_link:
+            source_account = author.lstrip("@")
+            if not USERNAME_PATTERN.fullmatch(source_account):
+                source_account = post.account
+            source_url = f"{OFFICIAL_STATUS_BASE_URL}/{source_account}/status/{post.post_id}"
+            lines.extend(["", f"原文：{source_url}"])
         return "\n".join(lines)
 
     @staticmethod
@@ -2308,15 +2606,128 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         return self._state_store
 
     async def _sync_subscription_mirror(self) -> None:
-        """把真实订阅快照写入后台只读展示，并移除旧全局订阅字段。"""
+        """把真实订阅快照及版本标识写入后台，并移除旧全局订阅字段。"""
 
         snapshot = self._require_subscription_store().snapshot()
         changed = await asyncio.to_thread(self._config_mirror.sync, snapshot)
         if changed:
-            self.ctx.logger.info("NitterToMaiBot 后台只读订阅列表已同步")
+            self.ctx.logger.info("NitterToMaiBot 后台订阅列表已同步")
+
+    def _subscription_config_snapshot(self) -> Dict[str, object]:
+        """把后台配置模型转换为订阅存储可校验的完整快照。"""
+
+        subscription_store = self._require_subscription_store()
+        groups = [
+            {"group_id": group.group_id, "enabled": group.enabled}
+            for group in self.config.subscriptions.groups
+        ]
+        accounts: List[Dict[str, object]] = []
+        for account_config in self.config.subscriptions.accounts:
+            account = account_config.account
+            account_snapshot: Dict[str, object] = {
+                "account": account,
+                "qq_groups": list(account_config.qq_groups),
+                "media_only_qq_groups": list(account_config.media_only_qq_groups),
+            }
+            display_name = subscription_store.display_name(account)
+            if display_name:
+                account_snapshot["display_name"] = display_name
+            accounts.append(account_snapshot)
+        return {
+            "version": SUBSCRIPTION_VERSION,
+            "groups": groups,
+            "accounts": accounts,
+        }
+
+    def _validate_subscription_account_limit(self, snapshot: Dict[str, object]) -> None:
+        """后台整体编辑同样遵守每群订阅账号上限。"""
+
+        account_limit = self.config.interaction.max_accounts_per_group
+        if account_limit == 0:
+            return
+        raw_accounts = snapshot.get("accounts")
+        if not isinstance(raw_accounts, list):
+            raise TypeError("后台账号订阅列表必须是列表")
+        counts: Dict[str, int] = {}
+        for raw_account in raw_accounts:
+            if not isinstance(raw_account, dict):
+                raise TypeError("后台账号订阅记录必须是对象")
+            raw_groups = raw_account.get("qq_groups")
+            if not isinstance(raw_groups, list):
+                raise TypeError("后台账号订阅群必须是列表")
+            for group_id in raw_groups:
+                if not isinstance(group_id, str):
+                    raise TypeError("后台账号订阅群号必须是字符串")
+                counts[group_id] = counts.get(group_id, 0) + 1
+        exceeded_groups = [
+            group_id for group_id, count in counts.items() if count > account_limit
+        ]
+        if exceeded_groups:
+            group_labels = "、".join(sorted(exceeded_groups))
+            raise ValueError(
+                f"QQ群 {group_labels} 的订阅账号数超过每群上限 {account_limit}"
+            )
+
+    async def _apply_subscription_config_update(self) -> None:
+        """在允许的管理模式下，把后台订阅编辑事务性写回真实存储。"""
+
+        subscription_store = self._require_subscription_store()
+        current_snapshot = subscription_store.snapshot()
+        desired_snapshot = self._subscription_config_snapshot()
+        current_revision = subscription_revision(current_snapshot)
+        desired_revision = self.config.subscriptions.revision
+
+        current_content = {
+            "groups": current_snapshot["groups"],
+            "accounts": current_snapshot["accounts"],
+        }
+        desired_content = {
+            "groups": desired_snapshot["groups"],
+            "accounts": desired_snapshot["accounts"],
+        }
+        if desired_content == current_content:
+            await self._sync_subscription_mirror()
+            return
+
+        management_mode = self.config.interaction.subscription_management_mode
+        if management_mode == "仅群命令":
+            self.ctx.logger.warning(
+                "当前订阅管理方式为仅群命令，已拒绝并还原后台订阅列表修改"
+            )
+            await self._sync_subscription_mirror()
+            return
+        if desired_revision != current_revision:
+            self.ctx.logger.warning(
+                "后台订阅页面版本已过期，已拒绝本次保存：页面版本=%s，当前版本=%s",
+                desired_revision or "<空>",
+                current_revision,
+            )
+            await self._sync_subscription_mirror()
+            return
+
+        changed = False
+        try:
+            self._validate_subscription_account_limit(desired_snapshot)
+            changed = subscription_store.replace_snapshot(desired_snapshot)
+            if changed:
+                await asyncio.to_thread(subscription_store.save)
+        except Exception:
+            if changed:
+                await asyncio.to_thread(subscription_store.load)
+            await self._sync_subscription_mirror()
+            raise
+
+        await self._sync_subscription_mirror()
+        if changed:
+            self._wake_event.set()
+            self.ctx.logger.info(
+                "已从后台应用订阅列表：groups=%d，accounts=%d",
+                subscription_store.group_count(),
+                subscription_store.account_count(),
+            )
 
     async def _update_subscription_display_names(self, display_names: Dict[str, str]) -> None:
-        """批量保存 RSS 中解析到的账号显示名，并同步后台只读镜像。"""
+        """批量保存 RSS 中解析到的账号显示名，并同步后台订阅镜像。"""
 
         if not display_names:
             return

@@ -1,8 +1,10 @@
-"""把统一订阅数据同步到插件配置页的只读展示区。"""
+"""在统一订阅数据与插件后台配置页之间同步订阅快照。"""
 
 from pathlib import Path
 from typing import Dict, List
 
+import hashlib
+import json
 import os
 
 import tomlkit
@@ -12,29 +14,47 @@ class _ConfigMirrorConflictError(RuntimeError):
     """配置在镜像写入期间被其他来源修改。"""
 
 
+def subscription_revision(snapshot: Dict[str, object]) -> str:
+    """根据规范化订阅快照生成稳定版本标识，用于拒绝后台过期保存。"""
+
+    revision_payload = {
+        "groups": snapshot.get("groups", []),
+        "accounts": snapshot.get("accounts", []),
+    }
+    serialized = json.dumps(
+        revision_payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return hashlib.sha256(serialized).hexdigest()
+
+
 class SubscriptionConfigMirror:
-    """只更新配置文件中的订阅镜像，并清空已经迁移的旧配置字段。"""
+    """更新配置文件中的订阅快照，并清空已经迁移的旧配置字段。"""
 
     def __init__(self, config_path: Path) -> None:
         self.config_path = config_path
 
     def sync(self, snapshot: Dict[str, object]) -> bool:
-        """同步只读镜像；检测到并发保存时重新读取最新配置后重试。"""
+        """同步订阅快照；检测到并发保存时重新读取最新配置后重试。"""
 
         groups = self._snapshot_groups(snapshot)
         accounts = self._snapshot_accounts(snapshot)
+        revision = subscription_revision({"groups": groups, "accounts": accounts})
         for attempt in range(3):
             try:
-                return self._sync_once(groups, accounts)
+                return self._sync_once(groups, accounts, revision)
             except _ConfigMirrorConflictError as exc:
                 if attempt == 2:
-                    raise RuntimeError("后台配置持续发生并发修改，订阅只读镜像同步失败") from exc
-        raise AssertionError("订阅只读镜像重试流程异常")
+                    raise RuntimeError("后台配置持续发生并发修改，订阅快照同步失败") from exc
+        raise AssertionError("订阅快照重试流程异常")
 
     def _sync_once(
         self,
         groups: List[Dict[str, object]],
         accounts: List[Dict[str, object]],
+        revision: str,
     ) -> bool:
         """基于同一次配置快照完成一次同步尝试。"""
 
@@ -47,6 +67,7 @@ class SubscriptionConfigMirror:
         delivery = raw_document.get("delivery", {})
         if (
             isinstance(raw_subscriptions, dict)
+            and raw_subscriptions.get("revision", "") == revision
             and raw_subscriptions.get("groups", []) == groups
             and raw_subscriptions.get("accounts", []) == accounts
             and isinstance(nitter, dict)
@@ -60,7 +81,7 @@ class SubscriptionConfigMirror:
             raise ValueError(f"插件配置缺少 nitter 或 delivery 配置节: {self.config_path}")
         document["nitter"]["accounts"] = []
         document["delivery"]["qq_groups"] = []
-        document["subscriptions"] = self._build_subscription_table(groups, accounts)
+        document["subscriptions"] = self._build_subscription_table(groups, accounts, revision)
         self._atomic_write(document, original_content)
         return True
 
@@ -121,8 +142,10 @@ class SubscriptionConfigMirror:
     def _build_subscription_table(
         groups: List[Dict[str, object]],
         accounts: List[Dict[str, object]],
+        revision: str,
     ) -> tomlkit.items.Table:
         subscriptions = tomlkit.table()
+        subscriptions.add("revision", revision)
         group_tables = tomlkit.aot()
         for group in groups:
             group_table = tomlkit.table()

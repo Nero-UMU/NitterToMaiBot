@@ -36,6 +36,43 @@ class SubscriptionStoreTests(TestCase):
             self.assertTrue(loaded.is_media_only("10002", "OpenAI"))
             self.assertFalse(loaded.is_push_enabled("10002"))
 
+    def test_replace_snapshot_validates_and_replaces_atomically(self) -> None:
+        """后台完整快照应经过现有结构校验后一次性替换。"""
+
+        with TemporaryDirectory() as temp_dir:
+            store = SubscriptionStore(Path(temp_dir) / "subscriptions.json")
+            store.subscribe("10001", "old_account")
+            desired = {
+                "version": 3,
+                "groups": [{"group_id": "20002", "enabled": False}],
+                "accounts": [
+                    {
+                        "account": "OpenAI",
+                        "qq_groups": ["20002"],
+                        "media_only_qq_groups": ["20002"],
+                    }
+                ],
+            }
+
+            self.assertTrue(store.replace_snapshot(desired))
+            self.assertEqual(store.subscriptions_for_group("10001"), [])
+            self.assertEqual(store.subscriptions_for_group("20002"), [("OpenAI", True)])
+            self.assertFalse(store.is_push_enabled("20002"))
+
+            invalid = {
+                "groups": [{"group_id": "30003", "enabled": True}],
+                "accounts": [
+                    {
+                        "account": "broken",
+                        "qq_groups": ["99999"],
+                        "media_only_qq_groups": [],
+                    }
+                ],
+            }
+            with self.assertRaises(ValueError):
+                store.replace_snapshot(invalid)
+            self.assertEqual(store.subscriptions_for_group("20002"), [("OpenAI", True)])
+
     def test_unsubscribe_is_case_insensitive(self) -> None:
         with TemporaryDirectory() as temp_dir:
             store = SubscriptionStore(Path(temp_dir) / "subscriptions.json")

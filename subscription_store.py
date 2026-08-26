@@ -246,7 +246,7 @@ class SubscriptionStore:
         return changed
 
     def snapshot(self) -> Dict[str, object]:
-        """返回适合持久化和后台只读展示的稳定结构。"""
+        """返回适合持久化和后台管理的稳定结构。"""
 
         groups = [
             {"group_id": group_id, "enabled": enabled}
@@ -270,6 +270,25 @@ class SubscriptionStore:
             "groups": groups,
             "accounts": accounts,
         }
+
+    def replace_snapshot(self, snapshot: Dict[str, object]) -> bool:
+        """严格校验并整体替换订阅快照，返回规范化结果是否发生变化。"""
+
+        raw_snapshot = {
+            "version": SUBSCRIPTION_VERSION,
+            "groups": snapshot.get("groups"),
+            "accounts": snapshot.get("accounts"),
+        }
+        candidate = SubscriptionStore(self.path)
+        candidate._load_account_mapping(raw_snapshot, include_media_filters=True)
+        candidate._needs_save = False
+        if candidate.snapshot() == self.snapshot():
+            return False
+
+        self._groups = candidate._groups
+        self._accounts = candidate._accounts
+        self._needs_save = True
+        return True
 
     def group_count(self) -> int:
         """返回有账号订阅关系的 QQ 群数量。"""
