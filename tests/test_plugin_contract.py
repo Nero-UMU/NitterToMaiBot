@@ -130,7 +130,7 @@ class PluginContractTests(TestCase):
         self.assertEqual(config.nitter.poll_interval_seconds, 600)
         self.assertEqual(config.delivery.forward_batch_threshold, 1)
         self.assertEqual(config.delivery.forward_split_attempts, 3)
-        self.assertEqual(config.plugin.config_version, "1.6.2")
+        self.assertEqual(config.plugin.config_version, "1.6.3")
         self.assertFalse(config.translation.enabled)
         self.assertEqual(config.translation.model, "utils")
         self.assertEqual(config.translation.prompt, TRANSLATION_SYSTEM_PROMPT)

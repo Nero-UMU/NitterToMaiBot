@@ -7,6 +7,8 @@ from typing import Any, Dict, List, Tuple
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, patch
 
+import asyncio
+
 from maibot_sdk.context import PluginContext, PluginPaths
 
 from plugins.NitterToMaiBot.models import MediaAttachment, NitterPost
@@ -358,6 +360,56 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
             {"OpenAI": {"10001": False}, "elonmusk": {"10001": True}},
         )
         self.assertEqual([capability for capability, _payload in calls], ["send.text", "send.text"])
+
+    async def test_follow_command_does_not_wait_for_active_scan(self) -> None:
+        """订阅写入不应等待整轮网络扫描和消息发送完成。"""
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method
+            del plugin_id
+            del payload
+            del timeout_ms
+            return {"success": True}
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {"plugin": {"enabled": False, "config_version": "1.6.2"}}
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    rpc_call=rpc_call,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+            await plugin._scan_lock.acquire()
+            try:
+                with patch("plugins.NitterToMaiBot.plugin.NitterClient", _CommandNitterClient):
+                    result = await asyncio.wait_for(
+                        plugin.handle_follow(
+                            stream_id="qq-group-stream",
+                            group_id="10001",
+                            platform="qq",
+                            matched_groups={"accounts": "OpenAI"},
+                        ),
+                        timeout=1,
+                    )
+            finally:
+                plugin._scan_lock.release()
+            await plugin.on_unload()
+
+        self.assertTrue(result[0])
 
     async def test_follow_rechecks_group_limit_after_timeline_request(self) -> None:
         """读取时间线期间订阅发生变化时，提交阶段必须重新检查每群上限。"""

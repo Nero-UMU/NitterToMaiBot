@@ -120,6 +120,25 @@ class NitterClientParsingTests(TestCase):
         self.assertEqual(post.published_at.tzinfo, timezone.utc)
         self.assertEqual(post.media[0].url, "http://127.0.0.1:8080/pic/media%2Fphoto.jpg")
 
+    def test_parse_rss_ignores_empty_nitter_media_paths(self) -> None:
+        """Nitter 的 /pic/ 占位地址不能被当作可下载图片。"""
+
+        rss_sample = RSS_SAMPLE.replace(
+            b'<img src="http://public.example/pic/media%2Fphoto.jpg" />',
+            (
+                b'<img src="/pic/" />'
+                b'<img src="/i/videos/" />'
+                b'<img src="http://public.example/pic/media%2Fphoto.jpg" />'
+            ),
+        )
+
+        posts = self.client.parse_rss(rss_sample, "example")
+
+        self.assertEqual(
+            [media.url for media in posts[0].media],
+            ["http://127.0.0.1:8080/pic/media%2Fphoto.jpg"],
+        )
+
     def test_parse_profile_name_from_channel_title(self) -> None:
         self.assertEqual(
             self.client.parse_profile_name(RSS_SAMPLE, "example"),
@@ -212,6 +231,19 @@ class NitterClientParsingTests(TestCase):
         self.assertEqual(parser.author, "@example")
         self.assertEqual(parser.text(), "第一行\n第二行")
         self.assertEqual(parser.media, [("/pic/main.jpg", "image", "")])
+
+    def test_status_parser_ignores_empty_media_paths(self) -> None:
+        parser = _MainTweetMediaParser()
+        parser.feed(
+            """
+            <div id="m" class="main-tweet">
+              <a class="still-image" href="/pic/"><img src="/pic/"></a>
+              <video data-url="/i/videos/"><source src="/i/videos/" type="video/mp4" /></video>
+            </div>
+            """
+        )
+
+        self.assertEqual(parser.media, [])
 
     def test_external_media_url_is_not_rewritten(self) -> None:
         self.assertEqual(

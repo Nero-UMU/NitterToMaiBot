@@ -37,6 +37,7 @@ ACCOUNT_SEPARATOR_PATTERN = re.compile(r"[\s,，]+")
 MESSAGE_TOKEN = "message"
 FORWARD_TOKEN = "forward"
 DROPPED_FORWARD_TOKEN = "forward_dropped"
+DROPPED_MEDIA_TOKEN_PREFIX = "media_dropped:"
 BEIJING_TIMEZONE = ZoneInfo("Asia/Shanghai")
 OFFICIAL_STATUS_BASE_URL = "https://x.com"
 FOLLOW_LIST_FORWARD_THRESHOLD = 20
@@ -88,7 +89,7 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "启用插件", "hint": "开启后插件会按照下方轮询设置检查订阅账号。"},
     )
     config_version: str = Field(
-        default="1.6.2",
+        default="1.6.3",
         description="用于插件自动升级配置结构，由程序维护。",
         json_schema_extra={"disabled": True, "label": "配置版本", "hint": "只读字段，请勿手动修改。"},
     )
@@ -725,9 +726,8 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             return
 
         if self._subscription_store is not None:
-            async with self._scan_lock:
-                async with self._subscription_lock:
-                    await self._apply_subscription_config_update()
+            async with self._subscription_lock:
+                await self._apply_subscription_config_update()
         if self._state_store is not None:
             self._state_store.max_seen_per_account = self.config.nitter.max_seen_posts_per_account
         if self.config.plugin.enabled:
@@ -898,51 +898,43 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         updated_count = 0
         commit_limit_error = ""
         if fetched_timelines or mode_updates:
-            async with self._scan_lock:
-                async with self._subscription_lock:
-                    state_store = self._require_state_store()
-                    latest_account_keys = {
-                        account.lower()
-                        for account in subscription_store.accounts_for_group(group_id)
-                    }
-                    latest_new_count = sum(
-                        account.lower() not in latest_account_keys
-                        for account in fetched_timelines
-                    )
-                    if (
-                        account_limit > 0
-                        and len(latest_account_keys) + latest_new_count > account_limit
-                    ):
-                        commit_limit_error = f"当前群最多可订阅 {account_limit} 个账号。"
-                    else:
-                        for account in mode_updates:
-                            if subscription_store.set_media_only(group_id, account, media_only):
-                                updated_count += 1
-                                result_by_account[account.lower()] = (
-                                    f"✓ 已将当前群的 @{account} 设置为 [{mode_label}]"
-                                )
-                        for account, posts in fetched_timelines.items():
-                            if subscription_store.subscribe(group_id, account, media_only=media_only):
-                                added_count += 1
-                                result_by_account[account.lower()] = (
-                                    f"✓ 已为当前群订阅 @{account} [{mode_label}]"
-                                )
-                            elif subscription_store.set_media_only(group_id, account, media_only):
-                                updated_count += 1
-                                result_by_account[account.lower()] = (
-                                    f"✓ 已将当前群的 @{account} 设置为 [{mode_label}]"
-                                )
-                            profile_name = fetched_profile_names.get(account, "")
-                            if profile_name:
-                                subscription_store.set_display_name(account, profile_name)
-                            if not state_store.has_account(account):
-                                baseline = []
-                                if not self.config.nitter.send_existing_on_first_run:
-                                    baseline = list(reversed([post.post_id for post in posts]))
-                                state_store.mark_baseline(account, baseline)
-                        await asyncio.to_thread(subscription_store.save)
-                        await asyncio.to_thread(state_store.save)
-                        await self._sync_subscription_mirror()
+            async with self._subscription_lock:
+                latest_account_keys = {
+                    account.lower()
+                    for account in subscription_store.accounts_for_group(group_id)
+                }
+                latest_new_count = sum(
+                    account.lower() not in latest_account_keys
+                    for account in fetched_timelines
+                )
+                if (
+                    account_limit > 0
+                    and len(latest_account_keys) + latest_new_count > account_limit
+                ):
+                    commit_limit_error = f"当前群最多可订阅 {account_limit} 个账号。"
+                else:
+                    for account in mode_updates:
+                        if subscription_store.set_media_only(group_id, account, media_only):
+                            updated_count += 1
+                            result_by_account[account.lower()] = (
+                                f"✓ 已将当前群的 @{account} 设置为 [{mode_label}]"
+                            )
+                    for account in fetched_timelines:
+                        if subscription_store.subscribe(group_id, account, media_only=media_only):
+                            added_count += 1
+                            result_by_account[account.lower()] = (
+                                f"✓ 已为当前群订阅 @{account} [{mode_label}]"
+                            )
+                        elif subscription_store.set_media_only(group_id, account, media_only):
+                            updated_count += 1
+                            result_by_account[account.lower()] = (
+                                f"✓ 已将当前群的 @{account} 设置为 [{mode_label}]"
+                            )
+                        profile_name = fetched_profile_names.get(account, "")
+                        if profile_name:
+                            subscription_store.set_display_name(account, profile_name)
+                    await asyncio.to_thread(subscription_store.save)
+                    await self._sync_subscription_mirror()
 
         if commit_limit_error:
             return await self._command_response(False, commit_limit_error, stream_id)
@@ -1003,16 +995,15 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         subscription_store = self._require_subscription_store()
         removed_accounts: List[str] = []
         missing_accounts: List[str] = []
-        async with self._scan_lock:
-            async with self._subscription_lock:
-                for account in accounts:
-                    if subscription_store.unsubscribe(group_id, account):
-                        removed_accounts.append(account)
-                    else:
-                        missing_accounts.append(account)
-                if removed_accounts:
-                    await asyncio.to_thread(subscription_store.save)
-                    await self._sync_subscription_mirror()
+        async with self._subscription_lock:
+            for account in accounts:
+                if subscription_store.unsubscribe(group_id, account):
+                    removed_accounts.append(account)
+                else:
+                    missing_accounts.append(account)
+            if removed_accounts:
+                await asyncio.to_thread(subscription_store.save)
+                await self._sync_subscription_mirror()
 
         lines = [f"已从当前群取关 @{account}" for account in removed_accounts]
         lines.extend(f"当前群未订阅 @{account}" for account in missing_accounts)
@@ -1099,15 +1090,14 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         media_only = raw_status == "on"
         subscription_count = 0
         changed_count = 0
-        async with self._scan_lock:
-            async with self._subscription_lock:
-                subscription_store = self._require_subscription_store()
-                subscription_count = len(subscription_store.subscriptions_for_group(group_id))
-                if subscription_count:
-                    changed_count = subscription_store.set_group_media_only(group_id, media_only)
-                    if changed_count:
-                        await asyncio.to_thread(subscription_store.save)
-                        await self._sync_subscription_mirror()
+        async with self._subscription_lock:
+            subscription_store = self._require_subscription_store()
+            subscription_count = len(subscription_store.subscriptions_for_group(group_id))
+            if subscription_count:
+                changed_count = subscription_store.set_group_media_only(group_id, media_only)
+                if changed_count:
+                    await asyncio.to_thread(subscription_store.save)
+                    await self._sync_subscription_mirror()
 
         if not subscription_count:
             return await self._command_response(
@@ -1156,12 +1146,11 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         enabled = raw_status in {"开启", "on"}
         subscription_store = self._require_subscription_store()
         group_exists = False
-        async with self._scan_lock:
-            async with self._subscription_lock:
-                group_exists = subscription_store.set_push_enabled(group_id, enabled)
-                if group_exists:
-                    await asyncio.to_thread(subscription_store.save)
-                    await self._sync_subscription_mirror()
+        async with self._subscription_lock:
+            group_exists = subscription_store.set_push_enabled(group_id, enabled)
+            if group_exists:
+                await asyncio.to_thread(subscription_store.save)
+                await self._sync_subscription_mirror()
         if not group_exists:
             return await self._command_response(
                 False,
@@ -1522,7 +1511,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                     {"role": "system", "content": self.config.translation.prompt},
                     {"role": "user", "content": source_text},
                 ],
-                model=self.config.translation.model,
+                task_name=self.config.translation.model,
                 temperature=0.1,
                 max_tokens=2048,
             )
@@ -1681,16 +1670,31 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         *,
         tolerate_media_errors: bool,
     ) -> Tuple[Dict[str, Any], int]:
-        """构造只包含正文和内嵌图片的合并转发节点。"""
+        """构造正文和内嵌图片节点，并提示需要在包后另发的附件。"""
 
         segments: List[Dict[str, Any]] = [
             {"type": "text", "content": self._format_post_text(post)}
         ]
         inline_bytes = 0
         per_image_limit = self.config.delivery.max_media_size_mb * 1024 * 1024
-        for media in self._select_media(post.media):
+        selected_media = self._select_media(post.media)
+        deferred_types = {media.media_type for media in selected_media if media.media_type != "image"}
+        deferred_labels = [
+            label
+            for media_type, label in (("video", "视频"), ("file", "文件"))
+            if media_type in deferred_types
+        ]
+        if deferred_labels:
+            segments.append(
+                {
+                    "type": "text",
+                    "content": f"\n媒体提示：{'、'.join(deferred_labels)}将在合并转发后单独发送",
+                }
+            )
+
+        for media in selected_media:
             if media.media_type != "image":
-                raise ValueError(f"推文 {post.post_id} 含有不能内嵌到合并转发的附件")
+                continue
             try:
                 media_data, _content_type = await client.download_media(
                     media.url,
@@ -1741,26 +1745,11 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         inline_budget = self.config.delivery.max_media_size_mb * 1024 * 1024
 
         for post in posts:
-            selected_media = self._select_media(post.media)
-            if any(media.media_type != "image" for media in selected_media):
-                if batch_nodes:
-                    await self._send_forward_batch_to_group(
-                        group_id,
-                        batch_posts,
-                        batch_nodes,
-                        stream_id,
-                    )
-                    batch_posts = []
-                    batch_nodes = []
-                    batch_inline_bytes = 0
-                await self._deliver_post_to_group(client, post, group_id, stream_id)
-                continue
-
             try:
                 node, post_inline_bytes = await self._build_inline_image_forward_node(
                     client,
                     post,
-                    tolerate_media_errors=False,
+                    tolerate_media_errors=True,
                 )
             except Exception:
                 if batch_nodes:
@@ -1817,6 +1806,19 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 batch_nodes,
                 stream_id,
             )
+
+        # 合并包全部处理完后再补发视频和其他文件，避免一个视频把前后推文切成三段。
+        for post in posts:
+            if any(
+                media.media_type != "image"
+                for media in self._select_media(post.media)
+            ):
+                await self._deliver_deferred_media_to_group(
+                    client,
+                    post,
+                    group_id,
+                    stream_id,
+                )
 
     async def _send_forward_batch_to_group(
         self,
@@ -1888,10 +1890,35 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             return
 
         state_store = self._require_state_store()
+        context_posts: List[NitterPost] = []
         for post in posts:
-            state_store.mark_token_completed(post.account, post.post_id, group_id, FORWARD_TOKEN)
+            selected_media = self._select_media(post.media)
+            deferred_media = [media for media in selected_media if media.media_type != "image"]
+            if deferred_media:
+                state_store.mark_token_completed(
+                    post.account,
+                    post.post_id,
+                    group_id,
+                    MESSAGE_TOKEN,
+                )
+                for media in selected_media:
+                    if media.media_type == "image":
+                        state_store.mark_token_completed(
+                            post.account,
+                            post.post_id,
+                            group_id,
+                            self._media_token(media),
+                        )
+            else:
+                state_store.mark_token_completed(
+                    post.account,
+                    post.post_id,
+                    group_id,
+                    FORWARD_TOKEN,
+                )
+                context_posts.append(post)
         await asyncio.to_thread(state_store.save)
-        await self._sync_posts_to_context(posts, stream_id)
+        await self._sync_posts_to_context(context_posts, stream_id)
         self.ctx.logger.info(
             "已向 QQ 群 %s 合并转发一包 %d 条推文",
             group_id,
@@ -2129,8 +2156,16 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 )
                 return summary
 
+            current_targets = {
+                account.lower(): group_filters
+                for account, group_filters in self._build_scan_targets().items()
+            }
             posts_by_group: Dict[str, List[NitterPost]] = {}
-            for post, qq_groups in pending_deliveries.values():
+            for post, _original_qq_groups in pending_deliveries.values():
+                current_group_filters = current_targets.get(post.account.lower())
+                if current_group_filters is None:
+                    continue
+                qq_groups = self._eligible_target_groups(post, current_group_filters)
                 for group_id in qq_groups:
                     posts_by_group.setdefault(group_id, []).append(post)
 
@@ -2258,6 +2293,73 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             completed_tokens.add(media_token)
         await self._sync_posts_to_context([post], stream_id)
 
+    async def _deliver_deferred_media_to_group(
+        self,
+        client: NitterClient,
+        post: NitterPost,
+        group_id: str,
+        stream_id: str,
+    ) -> None:
+        """在合并包之后发送不能内嵌的附件，单个附件失败不阻断其他推文。"""
+
+        state_store = self._require_state_store()
+        completed_tokens = state_store.completed_tokens(
+            post.account,
+            post.post_id,
+            group_id,
+        )
+        if FORWARD_TOKEN in completed_tokens or DROPPED_FORWARD_TOKEN in completed_tokens:
+            return
+        if MESSAGE_TOKEN not in completed_tokens:
+            return
+
+        had_pending_media = False
+        selected_media = self._select_media(post.media)
+        for index, media in enumerate(selected_media, start=1):
+            if media.media_type == "image":
+                continue
+            media_token = self._media_token(media)
+            dropped_token = self._dropped_media_token(media)
+            if media_token in completed_tokens or dropped_token in completed_tokens:
+                continue
+            had_pending_media = True
+            try:
+                media_sent = await self._send_media_attachment(
+                    client,
+                    post,
+                    media,
+                    index,
+                    stream_id,
+                )
+            except Exception:
+                media_sent = False
+                self.ctx.logger.warning(
+                    "向 QQ 群 %s 补发推文 @%s/%s 的%s时出现异常，已跳过该附件",
+                    group_id,
+                    post.account,
+                    post.post_id,
+                    media.media_type,
+                    exc_info=True,
+                )
+            if media_sent:
+                await self._record_delivery_token(post, group_id, media_token)
+                completed_tokens.add(media_token)
+                continue
+
+            self.ctx.logger.error(
+                "向 QQ 群 %s 补发推文 @%s/%s 的%s失败，已跳过该附件：%s",
+                group_id,
+                post.account,
+                post.post_id,
+                media.media_type,
+                media.url,
+            )
+            await self._record_delivery_token(post, group_id, dropped_token)
+            completed_tokens.add(dropped_token)
+
+        if had_pending_media and self._post_group_delivery_completed(post, group_id):
+            await self._sync_posts_to_context([post], stream_id)
+
     def _post_group_delivery_completed(self, post: NitterPost, group_id: str) -> bool:
         """判断推文在目标群中是否已经完整发送。"""
 
@@ -2268,9 +2370,13 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         )
         if FORWARD_TOKEN in completed_tokens or DROPPED_FORWARD_TOKEN in completed_tokens:
             return True
-        required_tokens = {MESSAGE_TOKEN}
-        required_tokens.update(self._media_token(media) for media in self._select_media(post.media))
-        return required_tokens.issubset(completed_tokens)
+        if MESSAGE_TOKEN not in completed_tokens:
+            return False
+        return all(
+            self._media_token(media) in completed_tokens
+            or self._dropped_media_token(media) in completed_tokens
+            for media in self._select_media(post.media)
+        )
 
     async def _resolve_group_stream(self, group_id: str, stream_cache: Dict[str, str]) -> str:
         """通过 SDK 打开真实 QQ 群聊天流，不自行计算 session_id。"""
@@ -2578,6 +2684,12 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         """为附件生成稳定的投递进度标识。"""
 
         return f"media:{sha256(media.url.encode('utf-8')).hexdigest()}"
+
+    @staticmethod
+    def _dropped_media_token(media: MediaAttachment) -> str:
+        """为已经记录并跳过的失败附件生成稳定标识。"""
+
+        return f"{DROPPED_MEDIA_TOKEN_PREFIX}{sha256(media.url.encode('utf-8')).hexdigest()}"
 
     @staticmethod
     def _build_media_filename(

@@ -42,6 +42,16 @@ NITTER_REQUEST_HEADERS = {
 }
 
 
+def _is_usable_media_reference(raw_url: str) -> bool:
+    """拒绝 Nitter 偶尔生成的空媒体占位路径。"""
+
+    normalized_url = raw_url.strip()
+    if not normalized_url:
+        return False
+    normalized_path = urlsplit(normalized_url).path.rstrip("/")
+    return normalized_path not in {"", "/pic", "/i/videos"}
+
+
 class NitterClientError(RuntimeError):
     """Nitter 请求或响应处理失败。"""
 
@@ -63,12 +73,13 @@ class _DescriptionParser(HTMLParser):
         normalized_tag = tag.lower()
         if normalized_tag in {"br", "p", "blockquote", "hr"}:
             self._parts.append("\n")
-        if normalized_tag == "img" and attributes.get("src"):
-            self.media.append((str(attributes["src"]), "image", ""))
-        if normalized_tag == "source" and attributes.get("src"):
+        image_source = str(attributes.get("src") or "")
+        if normalized_tag == "img" and _is_usable_media_reference(image_source):
+            self.media.append((image_source, "image", ""))
+        if normalized_tag == "source" and _is_usable_media_reference(image_source):
             mime_type = str(attributes.get("type") or "")
             media_type = "video" if mime_type.startswith("video/") else "file"
-            self.media.append((str(attributes["src"]), media_type, mime_type))
+            self.media.append((image_source, media_type, mime_type))
 
     def handle_endtag(self, tag: str) -> None:
         if tag.lower() in {"p", "blockquote"}:
@@ -132,24 +143,31 @@ class _MainTweetMediaParser(HTMLParser):
             self._capture_author = True
         if normalized_tag == "br" and self._content_div_depth > 0:
             self._content_parts.append("\n")
-        if normalized_tag == "a" and "still-image" in classes and attributes.get("href"):
-            self.media.append((str(attributes["href"]), "image", ""))
+        media_href = str(attributes.get("href") or "")
+        if (
+            normalized_tag == "a"
+            and "still-image" in classes
+            and _is_usable_media_reference(media_href)
+        ):
+            self.media.append((media_href, "image", ""))
         if normalized_tag in {"video", "source"}:
             self.has_video = True
         if normalized_tag == "div" and "video-overlay" in classes:
             self.has_video = True
-        if normalized_tag == "video" and attributes.get("data-url"):
+        video_url = str(attributes.get("data-url") or "")
+        if normalized_tag == "video" and _is_usable_media_reference(video_url):
             self.media.append(
                 (
-                    str(attributes["data-url"]),
+                    video_url,
                     "video",
                     "application/vnd.apple.mpegurl",
                 )
             )
-        if normalized_tag == "source" and attributes.get("src"):
+        source_url = str(attributes.get("src") or "")
+        if normalized_tag == "source" and _is_usable_media_reference(source_url):
             mime_type = str(attributes.get("type") or "")
             media_type = "video" if mime_type.startswith("video/") else "file"
-            self.media.append((str(attributes["src"]), media_type, mime_type))
+            self.media.append((source_url, media_type, mime_type))
 
     def handle_data(self, data: str) -> None:
         if self._quote_div_depth > 0:
@@ -258,7 +276,7 @@ class NitterClient:
         combined_media = list(post.media)
         known_urls = {media.url for media in combined_media}
         for raw_url, media_type, mime_type in parser.media:
-            if media_type == "image":
+            if media_type == "image" or not _is_usable_media_reference(raw_url):
                 continue
             media_url = self._absolute_url(raw_url)
             if media_url not in known_urls:
@@ -303,6 +321,8 @@ class NitterClient:
         media: List[MediaAttachment] = []
         known_urls = set()
         for raw_url, media_type, mime_type in parser.media:
+            if not _is_usable_media_reference(raw_url):
+                continue
             media_url = self._localize_media_url(raw_url)
             if media_url not in known_urls:
                 media.append(MediaAttachment(media_url, media_type, mime_type))
@@ -396,6 +416,8 @@ class NitterClient:
             media: List[MediaAttachment] = []
             known_urls = set()
             for raw_url, media_type, mime_type in description_parser.media:
+                if not _is_usable_media_reference(raw_url):
+                    continue
                 media_url = self._localize_media_url(raw_url)
                 if media_url not in known_urls:
                     media.append(MediaAttachment(media_url, media_type, mime_type))
@@ -403,7 +425,7 @@ class NitterClient:
 
             for enclosure in item.findall("enclosure"):
                 raw_url = str(enclosure.attrib.get("url") or "").strip()
-                if not raw_url:
+                if not _is_usable_media_reference(raw_url):
                     continue
                 mime_type = str(enclosure.attrib.get("type") or "").strip()
                 media_type = self._media_type_from_mime(mime_type)

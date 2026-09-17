@@ -196,7 +196,8 @@ class PluginScanTests(IsolatedAsyncioTestCase):
         self.assertIn("This is a test post.\n\n中文翻译：\n这是一条测试推文。", message_text)
         self.assertEqual(len(calls), 1)
         args = calls[0][1]["args"]
-        self.assertEqual(args["model"], "utils")
+        self.assertEqual(args["task_name"], "utils")
+        self.assertEqual(args["model"], "")
         self.assertEqual(args["temperature"], 0.1)
         self.assertEqual(args["max_tokens"], 2048)
         self.assertEqual(
@@ -1184,3 +1185,234 @@ class PluginScanTests(IsolatedAsyncioTestCase):
         ]
         self.assertIn("image", segment_types)
         self.assertNotIn("file", segment_types)
+
+    async def test_forward_batch_keeps_post_when_one_image_download_fails(self) -> None:
+        """坏图片只降级为地址文本，不能中断同批推文。"""
+
+        forward_calls: List[Dict[str, Any]] = []
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method
+            del plugin_id
+            del timeout_ms
+            forward_calls.append(payload)
+            return {"success": True}
+
+        class BrokenImageClient:
+            async def download_media(self, media_url: str, max_bytes: int) -> Tuple[bytes, str]:
+                del media_url
+                del max_bytes
+                raise RuntimeError("测试图片下载失败")
+
+        post = NitterPost(
+            account="broken_image",
+            post_id="9100",
+            author="@broken_image",
+            text="图片不可用时仍应发送正文",
+            published_at=datetime(2026, 9, 16, tzinfo=timezone.utc),
+            url="https://nitter.net/broken_image/status/9100",
+            media=[
+                MediaAttachment(
+                    "http://127.0.0.1:8080/pic/missing.jpg",
+                    "image",
+                    "image/jpeg",
+                )
+            ],
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {"plugin": {"enabled": False, "config_version": "1.6.2"}}
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    rpc_call=rpc_call,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+            await plugin._send_posts_to_group_in_batches(
+                BrokenImageClient(),
+                [post],
+                "10001",
+                "qq-group-stream",
+            )
+            completed_tokens = plugin._require_state_store().completed_tokens(
+                post.account,
+                post.post_id,
+                "10001",
+            )
+            await plugin.on_unload()
+
+        self.assertEqual(len(forward_calls), 1)
+        segments = forward_calls[0]["args"]["messages"][0]["segments"]
+        self.assertEqual([segment["type"] for segment in segments], ["text", "text"])
+        self.assertIn("missing.jpg", segments[1]["content"])
+        self.assertIn(FORWARD_TOKEN, completed_tokens)
+
+    async def test_video_post_does_not_split_surrounding_forward_batch(self) -> None:
+        """视频推文正文应留在原合并包中，视频在整包之后单独发送。"""
+
+        calls: List[Dict[str, Any]] = []
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method
+            del plugin_id
+            del timeout_ms
+            calls.append(payload)
+            return {"success": True}
+
+        posts = [
+            NitterPost(
+                account="before",
+                post_id="9201",
+                author="@before",
+                text="视频前的推文",
+                published_at=datetime(2026, 9, 16, 1, 0, tzinfo=timezone.utc),
+                url="https://nitter.net/before/status/9201",
+            ),
+            NitterPost(
+                account="video",
+                post_id="9202",
+                author="@video",
+                text="包含视频的推文",
+                published_at=datetime(2026, 9, 16, 1, 1, tzinfo=timezone.utc),
+                url="https://nitter.net/video/status/9202",
+                has_video=True,
+                media=[
+                    MediaAttachment(
+                        "https://video.twimg.com/video.mp4",
+                        "video",
+                        "video/mp4",
+                    )
+                ],
+            ),
+            NitterPost(
+                account="after",
+                post_id="9203",
+                author="@after",
+                text="视频后的推文",
+                published_at=datetime(2026, 9, 16, 1, 2, tzinfo=timezone.utc),
+                url="https://nitter.net/after/status/9203",
+            ),
+        ]
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {"plugin": {"enabled": False, "config_version": "1.6.2"}}
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    rpc_call=rpc_call,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+            await plugin._send_posts_to_group_in_batches(
+                _MultiAccountNitterClient("", 0, 0),
+                posts,
+                "10001",
+                "qq-group-stream",
+            )
+            video_tokens = plugin._require_state_store().completed_tokens(
+                "video",
+                "9202",
+                "10001",
+            )
+            await plugin.on_unload()
+
+        capabilities = [call["capability"] for call in calls]
+        self.assertEqual(capabilities, ["send.forward", "send.custom"])
+        self.assertEqual(len(calls[0]["args"]["messages"]), 3)
+        video_segments = calls[0]["args"]["messages"][1]["segments"]
+        self.assertIn("视频将在合并转发后单独发送", video_segments[1]["content"])
+        self.assertIn("message", video_tokens)
+        self.assertTrue(any(token.startswith("media:") for token in video_tokens))
+
+    async def test_failed_deferred_video_does_not_fail_whole_forward_batch(self) -> None:
+        """单个视频发送失败应被记录并跳过，不能让已发送的合并包反复重试。"""
+
+        calls: List[Dict[str, Any]] = []
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method
+            del plugin_id
+            del timeout_ms
+            calls.append(payload)
+            return {"success": payload["capability"] != "send.custom"}
+
+        video_post = NitterPost(
+            account="failed_video",
+            post_id="9301",
+            author="@failed_video",
+            text="视频发送失败测试",
+            published_at=datetime(2026, 9, 16, 2, 0, tzinfo=timezone.utc),
+            url="https://nitter.net/failed_video/status/9301",
+            has_video=True,
+            media=[
+                MediaAttachment(
+                    "https://video.twimg.com/failed.mp4",
+                    "video",
+                    "video/mp4",
+                )
+            ],
+        )
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {"plugin": {"enabled": False, "config_version": "1.6.2"}}
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    rpc_call=rpc_call,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+            await plugin._send_posts_to_group_in_batches(
+                _MultiAccountNitterClient("", 0, 0),
+                [video_post],
+                "10001",
+                "qq-group-stream",
+            )
+            completed = plugin._post_group_delivery_completed(video_post, "10001")
+            await plugin.on_unload()
+
+        self.assertEqual(
+            [call["capability"] for call in calls],
+            ["send.forward", "send.custom"],
+        )
+        self.assertTrue(completed)
