@@ -95,6 +95,166 @@ class _MultiAccountNitterClient:
 
 
 class PluginScanTests(IsolatedAsyncioTestCase):
+    async def test_failed_links_notice_follows_final_scan_results(self) -> None:
+        """只汇总最终失败链接，单条也合并，且提示失败不递归、不影响扫描。"""
+
+        cases = [
+            ("default_disabled", False, {"1001"}, False, False, False, 0),
+            ("one_failed", True, {"1001"}, False, False, False, 1),
+            ("both_failed", True, {"1001", "1002"}, False, False, False, 2),
+            ("recovered_children", True, set(), True, False, False, 0),
+            ("notice_rejected", True, {"1001"}, False, True, False, 1),
+            ("notice_exception", True, {"1001"}, False, False, True, 1),
+            ("no_split", True, {"1001"}, False, False, False, 2),
+            ("individual", True, {"1001"}, False, False, False, 1),
+        ]
+        for name, enabled, failed_ids, reject_parent, reject_notice, raise_notice, expected in cases:
+            with self.subTest(name=name), TemporaryDirectory() as temp_dir:
+                calls: List[Dict[str, Any]] = []
+
+                async def rpc_call(
+                    method: str,
+                    plugin_id: str,
+                    payload: Dict[str, Any],
+                    timeout_ms: int | None = None,
+                ) -> Dict[str, Any]:
+                    del method, plugin_id, timeout_ms
+                    calls.append(payload)
+                    if payload["capability"] == "chat.open_session":
+                        return {"success": True, "stream_id": "qq-group-stream"}
+                    if payload["capability"] == "send.text":
+                        return {"success": "https://x.com/first/status/1001" not in payload["args"]["text"]}
+                    self.assertEqual(payload["capability"], "send.forward")
+                    nodes = payload["args"]["messages"]
+                    if nodes[0]["message_id"] == "failed-links-notice":
+                        if raise_notice:
+                            raise RuntimeError("测试汇总消息异常")
+                        return {"success": not reject_notice}
+                    ids = {node["message_id"] for node in nodes}
+                    return {"success": not (ids & failed_ids or (reject_parent and len(ids) > 1))}
+
+                plugin = create_plugin()
+                use_temporary_config_mirror(plugin, temp_dir)
+                nitter_config: Dict[str, Any] = {
+                    "accounts": ["first", "second"],
+                    "send_existing_on_first_run": True,
+                }
+                if enabled:
+                    nitter_config["send_failed_links_forward"] = True
+                plugin.set_plugin_config(
+                    {
+                        "plugin": {"enabled": False, "config_version": "1.7.0"},
+                        "nitter": nitter_config,
+                        "delivery": {
+                            "qq_groups": ["10001"],
+                            "forward_split_attempts": 0 if name == "no_split" else 3,
+                            "forward_batch_threshold": 50 if name == "individual" else 1,
+                        },
+                    }
+                )
+                plugin._set_context(
+                    PluginContext(
+                        PLUGIN_ID,
+                        rpc_call=rpc_call,
+                        paths=PluginPaths(
+                            data_dir=Path(temp_dir) / "data",
+                            runtime_dir=Path(temp_dir) / "runtime",
+                        ),
+                    )
+                )
+                await plugin.on_load()
+                with patch("plugins.NitterToMaiBot.plugin.NitterClient", _MultiAccountNitterClient):
+                    summary = await plugin._scan_once()
+                await plugin.on_unload()
+
+                notices = [
+                    call for call in calls
+                    if call["capability"] == "send.forward"
+                    and call["args"]["messages"][0]["message_id"] == "failed-links-notice"
+                ]
+                dropped_count = 2 if name == "no_split" else len(failed_ids)
+                self.assertEqual(summary.dropped_posts, 0 if name == "individual" else dropped_count)
+                self.assertEqual(summary.forwarded_posts, 2 - dropped_count)
+                self.assertEqual(len(notices), int(expected > 0))
+                if expected:
+                    self.assertIs(calls[-1], notices[0])
+                    nodes = notices[0]["args"]["messages"]
+                    self.assertEqual(len(nodes), expected + 1)
+                    urls = [node["segments"][0]["content"] for node in nodes[1:]]
+                    expected_urls = [
+                        f"https://x.com/{account}/status/{post_id}"
+                        for account, post_id in (("first", "1001"), ("second", "1002"))
+                        if post_id in failed_ids or name == "no_split"
+                    ]
+                    self.assertEqual(urls, expected_urls)
+
+    async def test_failed_media_links_notice_is_sent_after_all_videos(self) -> None:
+        """补发视频之后才发送失败链接汇总，且不得发送给未订阅该账号的群。"""
+
+        calls: List[Dict[str, Any]] = []
+
+        async def rpc_call(
+            method: str,
+            plugin_id: str,
+            payload: Dict[str, Any],
+            timeout_ms: int | None = None,
+        ) -> Dict[str, Any]:
+            del method, plugin_id, timeout_ms
+            calls.append(payload)
+            capability = payload["capability"]
+            if capability == "chat.open_session":
+                return {"success": True, "stream_id": f"group-{payload['args']['group_id']}"}
+            if capability == "send.custom":
+                return {"success": payload["args"]["stream_id"] != "group-10001"}
+            return {"success": True}
+
+        with TemporaryDirectory() as temp_dir:
+            plugin = create_plugin()
+            use_temporary_config_mirror(plugin, temp_dir)
+            plugin.set_plugin_config(
+                {
+                    "plugin": {"enabled": False, "config_version": "1.7.0"},
+                    "nitter": {
+                        "send_existing_on_first_run": True,
+                        "send_failed_links_forward": True,
+                    },
+                }
+            )
+            plugin._set_context(
+                PluginContext(
+                    PLUGIN_ID,
+                    rpc_call=rpc_call,
+                    paths=PluginPaths(
+                        data_dir=Path(temp_dir) / "data",
+                        runtime_dir=Path(temp_dir) / "runtime",
+                    ),
+                )
+            )
+            await plugin.on_load()
+            store = plugin._require_subscription_store()
+            store.subscribe("10001", "first")
+            store.subscribe("10001", "second")
+            store.subscribe("10002", "second")
+            with patch("plugins.NitterToMaiBot.plugin.NitterClient", _FakeNitterClient):
+                await plugin._scan_once()
+            await plugin.on_unload()
+
+        group_calls = [call for call in calls if call["args"].get("stream_id") == "group-10001"]
+        self.assertEqual(
+            [call["capability"] for call in group_calls],
+            ["send.forward", "send.custom", "send.custom", "send.forward"],
+        )
+        # 两个订阅账号转发同一作者、同一推文时，失败汇总中只保留一个原文地址。
+        nodes = group_calls[-1]["args"]["messages"]
+        self.assertEqual(len(nodes), 2)
+        self.assertEqual(nodes[1]["segments"][0]["content"], "https://x.com/example/status/123456")
+        other_forwards = [
+            call for call in calls
+            if call["capability"] == "send.forward"
+            and call["args"]["stream_id"] == "group-10002"
+        ]
+        self.assertEqual(other_forwards, [])
+
     """验证扫描会通过真实 SDK 能力名打开群聊并发送。"""
 
     def test_post_text_uses_original_x_url(self) -> None:

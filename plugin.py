@@ -89,7 +89,7 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "启用插件", "hint": "开启后插件会按照下方轮询设置检查订阅账号。"},
     )
     config_version: str = Field(
-        default="1.6.3",
+        default="1.7.0",
         description="用于插件自动升级配置结构，由程序维护。",
         json_schema_extra={"disabled": True, "label": "配置版本", "hint": "只读字段，请勿手动修改。"},
     )
@@ -170,6 +170,14 @@ class NitterSectionConfig(PluginConfigBase):
         json_schema_extra={
             "label": "转发转推",
             "hint": "开启时发送账号自己发布的内容和转推；关闭时忽略转推。/推特解析不受此选项影响。",
+        },
+    )
+    send_failed_links_forward: bool = Field(
+        default=False,
+        description="订阅推送结束后，将本轮最终发送失败的推文原文链接汇总为一份 QQ 聊天记录。",
+        json_schema_extra={
+            "label": "汇总发送失败的推文链接",
+            "hint": "若存在转发失败的推文，则将原文链接打包发送至聊天框。",
         },
     )
 
@@ -2179,6 +2187,14 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 if not incomplete_posts:
                     continue
 
+                previous_tokens = {
+                    (post.account, post.post_id): state_store.completed_tokens(
+                        post.account, post.post_id, group_id
+                    )
+                    for post in incomplete_posts
+                }
+                failed_posts: List[NitterPost] = []
+
                 try:
                     stream_id = await self._resolve_group_stream(group_id, stream_cache)
                 except Exception:
@@ -2219,12 +2235,25 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                     try:
                         await self._deliver_post_to_group(client, post, group_id, stream_id)
                     except Exception:
+                        failed_posts.append(post)
                         self.ctx.logger.error(
                             "推文 %s 投递到 QQ 群 %s 失败",
                             post.post_id,
                             group_id,
                             exc_info=True,
                         )
+
+                # 二分最终放弃或附件补发失败才汇总，中间失败但重试成功的子包不列入。
+                for post in incomplete_posts:
+                    new_tokens = state_store.completed_tokens(
+                        post.account, post.post_id, group_id
+                    ) - previous_tokens[(post.account, post.post_id)]
+                    if DROPPED_FORWARD_TOKEN in new_tokens or any(
+                        token.startswith(DROPPED_MEDIA_TOKEN_PREFIX) for token in new_tokens
+                    ):
+                        failed_posts.append(post)
+                if self.config.nitter.send_failed_links_forward and failed_posts:
+                    await self._send_failed_post_links(failed_posts, group_id, stream_id)
 
             for post, qq_groups in pending_deliveries.values():
                 if not all(self._post_group_delivery_completed(post, group_id) for group_id in qq_groups):
@@ -2249,6 +2278,65 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
 
             summary.deferred_posts = state_store.quiet_post_count()
             return summary
+
+    async def _send_failed_post_links(
+        self,
+        posts: List[NitterPost],
+        group_id: str,
+        stream_id: str,
+    ) -> None:
+        """把本轮同群的失败原文链接去重后一次合并发送，不递归重试提示本身。"""
+
+        links = list(dict.fromkeys(self._post_source_url(post) for post in posts))
+        if not links:
+            return
+        notice = "此次转发中，以下推文或其附件未能完整发送，请自行打开原文查验。"
+        nodes: List[Dict[str, Any]] = [
+            {
+                "user_id": "0",
+                "nickname": "推文发送失败提示",
+                "message_id": "failed-links-notice",
+                "segments": [{"type": "text", "content": notice}],
+            },
+            *(
+                {
+                    "user_id": "0",
+                    "nickname": "推文原文",
+                    "message_id": f"failed-link-{index}",
+                    "segments": [{"type": "text", "content": link}],
+                }
+                for index, link in enumerate(links, start=1)
+            ),
+        ]
+        try:
+            sent = bool(
+                await self.ctx.send.forward(
+                    nodes,
+                    stream_id,
+                    processed_plain_text=f"[推文发送失败链接汇总，共 {len(links)} 条]",
+                    timeout_ms=120000,
+                )
+            )
+        except Exception:
+            self.ctx.logger.error(
+                "向 QQ 群 %s 发送 %d 条失败推文链接汇总时出现异常，不再重试提示",
+                group_id,
+                len(links),
+                exc_info=True,
+            )
+            return
+        if not sent:
+            self.ctx.logger.error(
+                "向 QQ 群 %s 发送 %d 条失败推文链接汇总失败，不再重试提示",
+                group_id,
+                len(links),
+            )
+        else:
+            self.ctx.logger.info(
+                "已向 QQ 群 %s 合并发送本轮 %d 条失败推文的原文链接",
+                group_id,
+                len(links),
+            )
 
     async def _deliver_post_to_group(
         self,
@@ -2672,12 +2760,18 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         if post.has_video and not any(media.media_type == "video" for media in post.media):
             lines.extend(["", "媒体提示：原推文包含视频，当前 Nitter 实例未提供可下载地址"])
         if include_source_link:
-            source_account = author.lstrip("@")
-            if not USERNAME_PATTERN.fullmatch(source_account):
-                source_account = post.account
-            source_url = f"{OFFICIAL_STATUS_BASE_URL}/{source_account}/status/{post.post_id}"
+            source_url = NitterToMaiBotPlugin._post_source_url(post)
             lines.extend(["", f"原文：{source_url}"])
         return "\n".join(lines)
+
+    @staticmethod
+    def _post_source_url(post: NitterPost) -> str:
+        """正文与失败提示共用 X 原文地址，避免输出 Nitter 实例地址。"""
+
+        source_account = post.author.lstrip("@")
+        if not USERNAME_PATTERN.fullmatch(source_account):
+            source_account = post.account
+        return f"{OFFICIAL_STATUS_BASE_URL}/{source_account}/status/{post.post_id}"
 
     @staticmethod
     def _media_token(media: MediaAttachment) -> str:
