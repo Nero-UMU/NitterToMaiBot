@@ -103,6 +103,9 @@ class PluginContractTests(TestCase):
             manifest = json.load(manifest_file)
 
         self.assertIn("send.forward", manifest["capabilities"])
+        self.assertIn("api.call", manifest["capabilities"])
+        self.assertIn("api.list", manifest["capabilities"])
+        self.assertIn("send.hybrid", manifest["capabilities"])
         self.assertIn("llm.generate", manifest["capabilities"])
         self.assertIn("maisaka.context.append", manifest["capabilities"])
         self.assertNotIn("config.get", manifest["capabilities"])
@@ -130,8 +133,8 @@ class PluginContractTests(TestCase):
         self.assertEqual(config.nitter.poll_interval_seconds, 600)
         self.assertEqual(config.delivery.forward_batch_threshold, 1)
         self.assertEqual(config.delivery.forward_split_attempts, 3)
-        self.assertEqual(config.plugin.config_version, "1.7.0")
-        self.assertFalse(config.nitter.send_failed_links_forward)
+        self.assertEqual(config.plugin.config_version, "1.8.3")
+        self.assertTrue(config.nitter.send_failed_links_forward)
         self.assertFalse(config.translation.enabled)
         self.assertEqual(config.translation.model, "utils")
         self.assertEqual(config.translation.prompt, TRANSLATION_SYSTEM_PROMPT)
@@ -150,6 +153,10 @@ class PluginContractTests(TestCase):
 
         schema = create_plugin().build_config_schema()
         sections = schema["sections"]
+        self.assertNotIn("max_posts_per_scan", sections["nitter"]["fields"])
+        self.assertEqual(NitterSectionConfig().check_interval_seconds, 300)
+        self.assertEqual(NitterSectionConfig().account_scan_interval_seconds, 2)
+        self.assertEqual(sections["nitter"]["fields"]["poll_interval_seconds"]["label"], "群转发间隔（秒）")
         split_field = sections["delivery"]["fields"]["forward_split_attempts"]
         self.assertEqual(split_field["min"], 0.0)
         self.assertEqual(split_field["max"], 10.0)

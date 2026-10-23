@@ -5,7 +5,7 @@ from typing import Tuple
 from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import patch
 
-from plugins.NitterToMaiBot.nitter_client import NitterClient, _MainTweetMediaParser
+from plugins.NitterToMaiBot.nitter_client import NitterClient, NitterClientError, _MainTweetMediaParser
 
 
 RSS_SAMPLE = b"""<?xml version="1.0" encoding="UTF-8"?>
@@ -108,6 +108,20 @@ class NitterClientParsingTests(TestCase):
 
     def setUp(self) -> None:
         self.client = NitterClient("http://127.0.0.1:8080", 20)
+
+    def test_rss_guid_url_is_normalized_to_numeric_post_id(self) -> None:
+        for guid in (
+            b"123456", b"http://old.nitter/example/status/123456#m",
+            b"https://new.nitter/example/status/123456?x=1#m",
+        ):
+            with self.subTest(guid=guid):
+                rss = RSS_SAMPLE.replace(b">123456</guid>", b">" + guid + b"</guid>")
+                self.assertEqual(self.client.parse_rss(rss, "example")[0].post_id, "123456")
+
+    def test_invalid_rss_guid_is_rejected(self) -> None:
+        rss = RSS_SAMPLE.replace(b">123456</guid>", b">not-a-post-id</guid>")
+        with self.assertRaisesRegex(NitterClientError, "推文 ID"):
+            self.client.parse_rss(rss, "example")
 
     def test_parse_rss_localizes_nitter_urls(self) -> None:
         posts = self.client.parse_rss(RSS_SAMPLE, "example")

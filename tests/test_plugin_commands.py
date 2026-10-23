@@ -110,6 +110,7 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
                 {
                     "platform": "qq",
                     "processed_plain_text": "https://x.com/OpenAI/status/123456?s=20",
+                    "raw_message": [{"type": "text", "data": "https://x.com/OpenAI/status/123456?s=20"}],
                     "session_id": "qq-private-stream",
                     "message_info": {
                         "user_info": {"user_id": "123456"},
@@ -121,6 +122,7 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
                 {
                     "platform": "qq",
                     "processed_plain_text": "普通私聊消息",
+                    "raw_message": [{"type": "text", "data": "普通私聊消息"}],
                     "session_id": "qq-private-stream",
                 }
             )
@@ -128,6 +130,82 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
         parse_status.assert_awaited_once_with("OpenAI", "123456", "qq-private-stream")
         self.assertEqual(hook_result, {"action": "abort"})
         self.assertEqual(continue_result, {"action": "continue"})
+
+    async def test_auto_parse_does_not_repeat_when_replying_to_link_or_bot_post(self) -> None:
+        plugin = create_plugin()
+        plugin.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.8.0"}})
+        link = "https://x.com/OpenAI/status/123456"
+        bot_text = plugin._format_post_text(NitterPost(
+            account="OpenAI", post_id="123456", author="@OpenAI", text="测试推文",
+            published_at=datetime(2026, 10, 21, tzinfo=timezone.utc), url=link,
+        ))
+        parse_status = AsyncMock()
+
+        with patch.object(plugin, "_parse_and_send_status", parse_status):
+            await plugin.handle_auto_parse_status({
+                "platform": "qq", "session_id": "qq-stream",
+                "processed_plain_text": link,
+                "raw_message": [{"type": "text", "data": link}],
+            })
+            for quoted_content in (link, bot_text):
+                for group_info in (None, {"group_id": "10001"}):
+                    with self.subTest(quoted_content=quoted_content, group_info=group_info):
+                        result = await plugin.handle_auto_parse_status({
+                            "platform": "qq", "session_id": "qq-stream", "reply_to": "previous-message",
+                            "message_info": {"group_info": group_info},
+                            "processed_plain_text": f"[回复了某人的消息: {quoted_content}] 不错",
+                            "raw_message": [
+                                {"type": "reply", "data": {
+                                    "target_message_id": "previous-message",
+                                    "target_message_content": quoted_content,
+                                }},
+                                {"type": "text", "data": "不错"},
+                            ],
+                        })
+                        self.assertEqual(result, {"action": "continue"})
+                        parse_status.assert_awaited_once_with("OpenAI", "123456", "qq-stream")
+
+    async def test_auto_parse_uses_new_body_link_in_reply(self) -> None:
+        plugin = create_plugin()
+        plugin.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.8.0"}})
+        old_link = "https://x.com/OpenAI/status/123456"
+        new_link = "https://x.com/example/status/654321"
+        parse_status = AsyncMock()
+
+        with patch.object(plugin, "_parse_and_send_status", parse_status):
+            result = await plugin.handle_auto_parse_status({
+                "platform": "qq", "session_id": "qq-stream", "reply_to": "previous-message",
+                "processed_plain_text": f"[回复了某人的消息: {old_link}] 看看这个 {new_link}",
+                "raw_message": [
+                    {"type": "reply", "data": {"target_message_content": old_link}},
+                    {"type": "at", "data": {"target_user_id": "123456"}},
+                    {"type": "text", "data": "看看这个 "},
+                    {"type": "text", "data": new_link},
+                ],
+            })
+
+        self.assertEqual(result, {"action": "abort"})
+        parse_status.assert_awaited_once_with("example", "654321", "qq-stream")
+
+    async def test_auto_parse_does_not_intercept_command_reply(self) -> None:
+        plugin = create_plugin()
+        plugin.set_plugin_config({"plugin": {"enabled": True, "config_version": "1.8.0"}})
+        link = "https://x.com/OpenAI/status/123456"
+        command = f"/推特解析 {link}"
+        parse_status = AsyncMock()
+
+        with patch.object(plugin, "_parse_and_send_status", parse_status):
+            result = await plugin.handle_auto_parse_status({
+                "platform": "qq", "session_id": "qq-stream",
+                "processed_plain_text": f"[回复了一条消息] {command}",
+                "raw_message": [
+                    {"type": "reply", "data": {"target_message_content": "旧消息"}},
+                    {"type": "text", "data": command},
+                ],
+            })
+
+        self.assertEqual(result, {"action": "continue"})
+        parse_status.assert_not_awaited()
 
     async def test_image_downloads_with_configured_limit_and_sends_inline(self) -> None:
         calls: List[Tuple[str, Dict[str, Any]]] = []
@@ -655,7 +733,7 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
                     published_at=datetime(2026, 8, 8, tzinfo=timezone.utc),
                     url=f"http://127.0.0.1:8080/OpenAI/status/{post_id}",
                 )
-                for post_id in (3, 2, 1)
+                for post_id in range(12, 0, -1)
             ]
             client = _CommandNitterClient("", 1, 1)
             client.fetch_timeline = AsyncMock(return_value=timeline)
@@ -673,7 +751,7 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
                 send_previews.reset_mock()
                 requested_result = await plugin.handle_posts(
                     stream_id="qq-group-stream",
-                    matched_groups={"account": "OpenAI", "count": "2"},
+                    matched_groups={"account": "OpenAI", "count": "11"},
                 )
                 requested_post_ids = [post.post_id for post in send_previews.await_args.args[1]]
 
@@ -685,8 +763,8 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
                 published_at=datetime(2026, 8, 8, tzinfo=timezone.utc),
                 url="http://127.0.0.1:8080/OpenAI/status/4",
                 media=[
-                    MediaAttachment("https://example.com/failed.jpg", "image", "image/jpeg"),
-                    MediaAttachment("https://example.com/success.jpg", "image", "image/jpeg"),
+                    MediaAttachment("https://example.com/failed.mp4", "video", "video/mp4"),
+                    MediaAttachment("https://example.com/success.mp4", "video", "video/mp4"),
                 ],
             )
             send_media = AsyncMock(side_effect=[False, True])
@@ -699,9 +777,9 @@ class PluginCommandTests(IsolatedAsyncioTestCase):
             await plugin.on_unload()
 
         self.assertEqual(default_result, (True, "已发送 @OpenAI 的最新 1 条推文。", 2))
-        self.assertEqual(default_post_ids, ["3"])
-        self.assertEqual(requested_result, (True, "已发送 @OpenAI 的最新 2 条推文。", 2))
-        self.assertEqual(requested_post_ids, ["3", "2"])
+        self.assertEqual(default_post_ids, ["12"])
+        self.assertEqual(requested_result, (True, "已发送 @OpenAI 的最新 11 条推文。", 2))
+        self.assertEqual(requested_post_ids, [str(post_id) for post_id in range(12, 1, -1)])
         self.assertEqual(send_media.await_count, 2)
 
     async def test_posts_preview_batches_only_above_configured_threshold(self) -> None:

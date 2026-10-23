@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "github.nero-umu.nitter-to-maibot",
-  "version": "1.7.0",
+  "version": "1.8.3",
   "name": "Nitter 推文转发",
   "description": "定期读取 Nitter 订阅账号的新推文，支持按 QQ 群独立订阅，并转发正文、图片和视频附件。",
   "author": {
@@ -29,14 +29,22 @@
       "type": "python_package",
       "name": "tomlkit",
       "version_spec": ">=0.13.3,<1"
+    },
+    {
+      "type": "python_package",
+      "name": "Pillow",
+      "version_spec": ">=10.4,<13"
     }
   ],
   "capabilities": [
+    "api.call",
+    "api.list",
     "chat.open_session",
     "llm.generate",
     "maisaka.context.append",
     "send.custom",
     "send.forward",
+    "send.hybrid",
     "send.image",
     "send.text"
   ],

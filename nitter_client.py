@@ -14,7 +14,7 @@ import asyncio
 import re
 import time
 
-from .models import HlsStreamSelection, MediaAttachment, NitterPost
+from .models import HlsStreamSelection, MediaAttachment, NitterPost, normalize_post_id
 
 
 MAX_DOCUMENT_BYTES = 4 * 1024 * 1024
@@ -394,7 +394,10 @@ class NitterClient:
 
         posts: List[NitterPost] = []
         for item in root.findall("./channel/item"):
-            post_id = self._required_text(item, "guid")
+            try:
+                post_id = normalize_post_id(self._required_text(item, "guid"))
+            except ValueError as exc:
+                raise NitterClientError(str(exc)) from exc
             title = self._required_text(item, "title")
             raw_description = item.findtext("description", default="")
             raw_link = self._required_text(item, "link")
