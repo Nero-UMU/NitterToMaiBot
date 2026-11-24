@@ -1,6 +1,6 @@
 """通过 SDK 公开 API 直接发送本地缓存组成的群合并转发，不自发消息。"""
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Set
 
 from maibot_sdk.context import PluginContext
 
@@ -39,7 +39,7 @@ class QQForwarder:
             return forwarder
         raise RuntimeError("没有已登录的适配器与设置的发送机器人 QQ 号匹配")
 
-    async def call_action(self, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
+    async def _action_data(self, action: str, params: Dict[str, Any]) -> Any:
         response = await self.ctx.api.call(
             self.api_name,
             version="1",
@@ -49,12 +49,31 @@ class QQForwarder:
         if not isinstance(response, dict):
             raise RuntimeError(f"QQ 动作 {action} 未返回有效响应")
         if response.get("retcode") != 0 or response.get("status") != "ok":
-            reason = response.get("message") or response.get("wording") or "未返回错误详情"
+            reason = response.get("message") or response.get("wording") or response.get("error") or "未返回错误详情"
             raise RuntimeError(f"QQ 动作 {action} 失败（{response.get('retcode')}）：{reason}")
-        data = response.get("data")
+        return response.get("data")
+
+    async def call_action(self, action: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        data = await self._action_data(action, params)
         if not isinstance(data, dict):
             raise RuntimeError(f"QQ 动作 {action} 未返回有效的 data")
         return data
+
+    async def friend_ids(self) -> Set[str]:
+        data = await self._action_data("get_friend_list", {"no_cache": True})
+        if not isinstance(data, list) or any(
+            not isinstance(friend, dict) or not str(friend.get("user_id", "")).isdecimal()
+            for friend in data
+        ):
+            raise RuntimeError("QQ 适配器未返回有效的好友列表")
+        return {str(friend["user_id"]) for friend in data}
+
+    async def group_name(self, group_id: str) -> str:
+        data = await self.call_action("get_group_info", {"group_id": group_id})
+        name = data.get("group_name")
+        if not isinstance(name, str) or not name.strip():
+            raise RuntimeError(f"QQ 适配器未返回群 {group_id} 的名称")
+        return name.strip()
 
     async def forward_to_group(self, group_id: str, nodes: List[Dict[str, Any]]) -> str:
         if not nodes:

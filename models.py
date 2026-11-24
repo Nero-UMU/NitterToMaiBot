@@ -90,3 +90,4 @@ class PendingDelivery:
     group_ids: List[str]
     staged: Optional[StagedPost] = None
     staging_failed: bool = False
+    collected_at: float = 0.0

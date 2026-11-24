@@ -26,6 +26,7 @@ class StateStore:
         self._quiet_queue: Dict[str, NitterPost] = {}
         self._delivery_queue: Dict[str, PendingDelivery] = {}
         self.last_forward_at: float = 0.0
+        self.ignore_posts_before: float = 0.0
 
     def load(self) -> None:
         """从磁盘读取状态；损坏的状态文件会明确报错。"""
@@ -104,10 +105,15 @@ class StateStore:
             post = self._deserialize_post(item.get("post"))
             groups = item.get("group_ids")
             failed = item.get("staging_failed", False)
+            collected_at = item.get("collected_at", 0.0)
             if (
                 not isinstance(groups, list)
                 or not all(isinstance(group, str) and group.isdigit() for group in groups)
                 or not isinstance(failed, bool)
+                or isinstance(collected_at, bool)
+                or not isinstance(collected_at, (int, float))
+                or not math.isfinite(collected_at)
+                or collected_at < 0
             ):
                 raise ValueError(f"NitterToMaiBot 待转发目标或标记无效: {self.path}")
             raw_staged = item.get("staged")
@@ -137,7 +143,7 @@ class StateStore:
                     staged = StagedPost(cached_media, tokens)
             if not self.is_seen(post.account, post.post_id):
                 queue[self._post_key(post.account, post.post_id)] = PendingDelivery(
-                    post, groups, staged, failed,
+                    post, groups, staged, failed, float(collected_at),
                 )
         self._delivery_queue = queue
         last_forward_at = raw_state.get("last_forward_at", 0.0)
@@ -147,6 +153,10 @@ class StateStore:
         ):
             raise ValueError(f"NitterToMaiBot 上次转发时间无效: {self.path}")
         self.last_forward_at = float(last_forward_at)
+        cutoff = raw_state.get("ignore_posts_before", 0.0)
+        if isinstance(cutoff, bool) or not isinstance(cutoff, (int, float)) or not math.isfinite(cutoff) or cutoff < 0:
+            raise ValueError(f"NitterToMaiBot 历史推文截止时间无效: {self.path}")
+        self.ignore_posts_before = float(cutoff)
 
     def snapshot(self) -> Dict[str, Any]:
         """复制可变容器，供扫描和群发并发时安全地在线程中写盘。"""
@@ -171,10 +181,12 @@ class StateStore:
                         "failed_media_tokens": list(item.staged.failed_media_tokens),
                     },
                     "staging_failed": item.staging_failed,
+                    "collected_at": item.collected_at,
                 }
                 for item in self._delivery_queue.values()
             ],
             "last_forward_at": self.last_forward_at,
+            "ignore_posts_before": self.ignore_posts_before,
         }
 
     def save(self, snapshot: Optional[Dict[str, Any]] = None) -> None:

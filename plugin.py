@@ -6,7 +6,7 @@ from hashlib import sha256
 from pathlib import Path
 from shutil import which
 from tempfile import TemporaryDirectory, mkstemp
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple, Union
+from typing import Any, AsyncIterator, Dict, List, Literal, Optional, Set, Tuple, Union
 from urllib.parse import unquote, urlsplit
 from zoneinfo import ZoneInfo
 
@@ -26,6 +26,7 @@ from .context_history import ContextHistory, SentContext, encode_image_preview
 from .media_cache import MediaCache
 from .models import CachedMedia, MediaAttachment, NitterPost, PendingDelivery, ScanSummary, StagedPost
 from .nitter_client import MediaTooLargeError, NitterClient, NitterClientError
+from .private_subscriptions import PrivateSubscriptions
 from .qq_forwarder import QQForwarder
 from .state_store import StateStore
 from .subscription_store import SUBSCRIPTION_VERSION, SubscriptionStore
@@ -40,6 +41,9 @@ STATUS_URL_PATTERN = re.compile(
 ACCOUNT_SEPARATOR_PATTERN = re.compile(r"[\s,，]+")
 MESSAGE_TOKEN = "message"
 FORWARD_TOKEN = "forward"
+GROUP_RECEIPT_PREFIX = "group_receipt:"
+PRIVATE_ATTEMPT_TOKEN = "private_attempted"
+PRIVATE_INCOMPLETE_TOKEN = "private_incomplete"
 DROPPED_FORWARD_TOKEN = "forward_dropped"
 DROPPED_MEDIA_TOKEN_PREFIX = "media_dropped:"
 FAILED_LINKS_NOTICE_TOKEN = "failed_links_notice"
@@ -64,6 +68,7 @@ HELP_TEXT = """推特命令帮助
 /推特订阅查询：查看当前群订阅及每个账号的推送类型
 /推特仅媒体 on|off：把本群全部订阅设为仅媒体或全部推文
 /推特推送 开启|关闭：控制当前群推送
+/推特私聊订阅、/推特私聊退订、/推特私聊查询：管理自己对当前群的私聊订阅
 
 推文获取（QQ 群聊或私聊）
 /推特推文 <账号> [数量]：获取最新推文，数量默认为 1
@@ -94,7 +99,7 @@ class PluginSectionConfig(PluginConfigBase):
         json_schema_extra={"label": "启用插件", "hint": "开启后插件会按照下方轮询设置检查订阅账号。"},
     )
     config_version: str = Field(
-        default="1.8.3",
+        default="1.9.2",
         description="用于插件自动升级配置结构，由程序维护。",
         json_schema_extra={"disabled": True, "label": "配置版本", "hint": "只读字段，请勿手动修改。"},
     )
@@ -190,10 +195,10 @@ class NitterSectionConfig(PluginConfigBase):
 
     send_failed_links_forward: bool = Field(
         default=True,
-        description="是否在群转发周期结束后，将最终发送失败的推文原文链接汇总为一份聊天记录。",
+        description="是否在转发周期结束后向群聊和私聊接收者汇总未完整送达的推文链接。",
         json_schema_extra={
             "label": "汇总发送失败的推文链接",
-            "hint": "若存在转发失败的推文，则将推文链接打包发送至聊天框。",
+            "hint": "同时控制群聊和私聊。私聊按来源群汇总。",
         },
     )
 
@@ -534,7 +539,7 @@ class SubscriptionViewSectionConfig(PluginConfigBase):
 
     __ui_label__ = "订阅列表"
     __ui_icon__ = "list-tree"
-    __ui_order__ = 7
+    __ui_order__ = 8
 
     revision: str = Field(
         default="",
@@ -628,6 +633,60 @@ class ContextSyncSectionConfig(PluginConfigBase):
     )
 
 
+class PrivateSubscriptionRecordConfig(PluginConfigBase):
+    """后台显示的一条私聊订阅关系。"""
+
+    user_id: str = Field(default="", description="接收者 QQ 号", json_schema_extra={"label": "用户 QQ 号"})
+    group_id: str = Field(default="", description="来源群号", json_schema_extra={"label": "来源群号"})
+
+    @field_validator("user_id", "group_id")
+    @classmethod
+    def validate_qq_id(cls, value: str) -> str:
+        value = value.strip()
+        if not QQ_ID_PATTERN.fullmatch(value):
+            raise ValueError("用户 QQ 号和来源群号必须是纯数字")
+        return value
+
+
+class PrivateSubscriptionSectionConfig(PluginConfigBase):
+    """允许机器人好友私聊接收他们订阅的群内推文。"""
+
+    __ui_label__ = "私聊订阅"
+    __ui_order__ = 7
+
+    enabled: bool = Field(
+        default=False,
+        description="允许机器人好友私聊接收其订阅的群内推文。",
+        json_schema_extra={
+            "label": "启用私聊订阅",
+            "hint": "群推送开启时复制已成功发送的转发包。群推送关闭时直接发给订阅者。",
+        },
+    )
+    management_mode: SubscriptionManagementMode = Field(
+        default="仅群命令",
+        description="决定谁可以修改私聊订阅关系。",
+        json_schema_extra={
+            "label": "私聊订阅管理方式",
+            "hint": "可选择只允许群命令修改、只允许后台修改，或同时允许两种方式。",
+        },
+    )
+    revision: str = Field(default="", json_schema_extra={"disabled": True, "hidden": True})
+    records: List[PrivateSubscriptionRecordConfig] = Field(
+        default_factory=list,
+        description="每条记录关联一个接收者和一个来源群。",
+        json_schema_extra={
+            "label": "私聊订阅列表",
+            "hint": "仅后台或群命令和后台模式下可以保存修改。",
+        },
+    )
+
+    @model_validator(mode="after")
+    def validate_unique_records(self) -> "PrivateSubscriptionSectionConfig":
+        if len({(row.group_id, row.user_id) for row in self.records}) != len(self.records):
+            raise ValueError("同一用户不能重复订阅同一个来源群")
+        return self
+
+
 class NitterToMaiBotConfig(PluginConfigBase):
     """插件完整配置模型。"""
 
@@ -639,6 +698,7 @@ class NitterToMaiBotConfig(PluginConfigBase):
     interaction: InteractionSectionConfig = Field(default_factory=InteractionSectionConfig)
     subscriptions: SubscriptionViewSectionConfig = Field(default_factory=SubscriptionViewSectionConfig)
     context_sync: ContextSyncSectionConfig = Field(default_factory=ContextSyncSectionConfig)
+    private_subscriptions: PrivateSubscriptionSectionConfig = Field(default_factory=PrivateSubscriptionSectionConfig)
 
 
 class NitterToMaiBotPlugin(MaiBotPlugin):
@@ -658,6 +718,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         self._state_store: Optional[StateStore] = None
         self._media_cache: Optional[MediaCache] = None
         self._subscription_store: Optional[SubscriptionStore] = None
+        self._private_subscriptions: Optional[PrivateSubscriptions] = None
         self._context_history: Optional[ContextHistory] = None
         self._context_lock = asyncio.Lock()
         self._restored_quotes: Dict[Tuple[str, str, str], None] = {}
@@ -730,6 +791,8 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             path=self.ctx.paths.data_dir / "subscriptions.json",
         )
         await asyncio.to_thread(self._subscription_store.load)
+        self._private_subscriptions = PrivateSubscriptions(self.ctx.paths.data_dir / "private_subscriptions.json")
+        await asyncio.to_thread(self._private_subscriptions.load)
         migrated_legacy = self._subscription_store.merge_legacy_global_subscriptions(
             self.config.nitter.accounts,
             self.config.delivery.qq_groups,
@@ -737,6 +800,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         if self._subscription_store.needs_save or migrated_legacy:
             await asyncio.to_thread(self._subscription_store.save)
         await self._sync_subscription_mirror()
+        await self._sync_private_subscription_mirror()
 
         if self.config.plugin.enabled:
             self._start_polling()
@@ -772,6 +836,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         if self._subscription_store is not None:
             async with self._subscription_lock:
                 await self._apply_subscription_config_update()
+                await self._apply_private_subscription_config_update()
         if self._state_store is not None:
             self._state_store.max_seen_per_account = self.config.nitter.max_seen_posts_per_account
         if self.config.plugin.enabled:
@@ -1211,6 +1276,67 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         return await self._command_response(True, response, stream_id)
 
     @Command(
+        "nitter_to_maibot_private_subscription",
+        description="订阅、退订或查询自己在当前 QQ 群的私聊推送",
+        pattern=r"^/推特私聊(?P<action>订阅|退订|查询)$",
+        timeout_ms=120000,
+    )
+    async def handle_private_subscription(
+        self,
+        stream_id: str = "",
+        group_id: str = "",
+        user_id: str = "",
+        platform: str = "",
+        matched_groups: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
+    ) -> Tuple[bool, str, int]:
+        del kwargs
+        if platform.lower() != "qq" or not group_id.isdecimal() or not user_id.isdecimal():
+            return await self._command_response(False, "请在 QQ 群内使用此命令。", stream_id)
+        subscriptions = self._require_private_subscriptions()
+        action = (matched_groups or {}).get("action")
+        if action == "查询":
+            subscribed = user_id in subscriptions.users(group_id)
+            response = "你已订阅本群的私聊推送。" if subscribed else "你尚未订阅本群的私聊推送。"
+            return await self._command_response(True, response, stream_id)
+        if self.config.private_subscriptions.management_mode == "仅后台":
+            return await self._command_response(False, "当前私聊订阅只能在后台修改。", stream_id)
+        if action == "退订":
+            async with self._subscription_lock:
+                if self.config.private_subscriptions.management_mode == "仅后台":
+                    return await self._command_response(False, "当前私聊订阅只能在后台修改。", stream_id)
+                changed = await asyncio.to_thread(subscriptions.set_subscribed, group_id, user_id, False)
+                if changed:
+                    await self._sync_private_subscription_mirror()
+            return await self._command_response(True, "已取消本群的私聊推送。", stream_id)
+        if action != "订阅" or not self.config.private_subscriptions.enabled:
+            return await self._command_response(False, "私聊订阅功能尚未开启。", stream_id)
+        if not self._require_subscription_store().subscriptions_for_group(group_id):
+            return await self._command_response(False, "本群还没有订阅推特账号。", stream_id)
+        try:
+            forwarder = await QQForwarder.connect(self.ctx, self.config.delivery.qq_account_id)
+            friends = await forwarder.friend_ids()
+        except Exception:
+            self.ctx.logger.warning("查询私聊订阅所需的 QQ 好友列表失败", exc_info=True)
+            return await self._command_response(False, "暂时无法验证好友关系，请稍后重试。", stream_id)
+        if user_id not in friends:
+            return await self._command_response(False, "请先添加发送推送的机器人为 QQ 好友，再订阅。", stream_id)
+        async with self._subscription_lock:
+            if self.config.private_subscriptions.management_mode == "仅后台":
+                return await self._command_response(False, "当前私聊订阅只能在后台修改。", stream_id)
+            if (
+                not self.config.private_subscriptions.enabled
+                or not self._require_subscription_store().subscriptions_for_group(group_id)
+            ):
+                return await self._command_response(False, "本群当前无法开通私聊推送。", stream_id)
+            changed = await asyncio.to_thread(subscriptions.set_subscribed, group_id, user_id, True)
+            if changed:
+                await self._sync_private_subscription_mirror()
+        if changed:
+            self._wake_event.set()
+        return await self._command_response(True, "已订阅本群的新推文私聊推送。", stream_id)
+
+    @Command(
         "nitter_to_maibot_posts",
         description="获取并发送指定账号的最新推文",
         pattern=r"^/(?:推特推文|twitter_posts)(?:\s+(?P<account>\S+))?(?:\s+(?P<count>\S+))?$",
@@ -1424,7 +1550,10 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
     def _build_scan_targets(self) -> Dict[str, Dict[str, bool]]:
         """从统一订阅存储生成当前启用的扫描与投递目标。"""
 
-        return self._require_subscription_store().target_subscriptions_by_account()
+        private_groups = (
+            self._require_private_subscriptions().groups() if self.config.private_subscriptions.enabled else None
+        )
+        return self._require_subscription_store().target_subscriptions_by_account(private_groups)
 
     @staticmethod
     def _eligible_target_groups(
@@ -1760,6 +1889,19 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
     ) -> None:
         """用本地缓存直接组装聊天记录，视频与图文同包，不先发送给自己。"""
 
+        async for batch_posts, batch_nodes in self._subscription_batches(posts, group_id, staged_cache):
+            await self._send_forward_batch_to_group(
+                group_id, batch_posts, batch_nodes, stream_id, forwarder,
+            )
+
+    async def _subscription_batches(
+        self,
+        posts: List[NitterPost],
+        group_id: str,
+        staged_cache: Dict[Tuple[str, str], StagedPost],
+    ) -> AsyncIterator[Tuple[List[NitterPost], List[StagedPost]]]:
+        """按来源群的原推文顺序生成使用同一份缓存的发送包。"""
+
         batch_posts: List[NitterPost] = []
         batch_nodes: List[StagedPost] = []
         node_count = 0
@@ -1792,9 +1934,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 node_count + node_count_for_post > MAX_SUBSCRIPTION_FORWARD_NODES
                 or batch_bytes + post_bytes > max_batch_bytes
             ):
-                await self._send_forward_batch_to_group(
-                    group_id, batch_posts, batch_nodes, stream_id, forwarder,
-                )
+                yield batch_posts, batch_nodes
                 batch_posts = []
                 batch_nodes = []
                 node_count = 0
@@ -1811,9 +1951,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             batch_bytes += post_bytes
 
         if batch_nodes:
-            await self._send_forward_batch_to_group(
-                group_id, batch_posts, batch_nodes, stream_id, forwarder,
-            )
+            yield batch_posts, batch_nodes
 
     async def _stage_subscription_post(
         self, client: NitterClient, post: NitterPost, *, cache: Optional[MediaCache] = None,
@@ -1941,6 +2079,10 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         state_store = self._require_state_store()
         for post, node in zip(posts, nodes, strict=True):
             state_store.mark_token_completed(post.account, post.post_id, group_id, FORWARD_TOKEN)
+            if self.config.private_subscriptions.enabled:
+                state_store.mark_token_completed(
+                    post.account, post.post_id, group_id, GROUP_RECEIPT_PREFIX + message_id,
+                )
             for token in node.failed_media_tokens:
                 state_store.mark_token_completed(post.account, post.post_id, group_id, token)
         await self._save_state()
@@ -2164,6 +2306,10 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             for post in reversed(posts):
                 if state_store.is_seen(account, post.post_id) or state_store.pending_delivery(account, post.post_id):
                     continue
+                if post.published_at.timestamp() <= state_store.ignore_posts_before:
+                    state_store.mark_seen(account, post.post_id)
+                    continue
+                collected_at = time.time()
                 if post.is_retweet and not self.config.nitter.include_retweets:
                     state_store.mark_seen(account, post.post_id)
                     continue
@@ -2173,7 +2319,9 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                     # 详情读取失败也保留原文链接，等本次群转发周期末再统一提示。
                     groups = self._eligible_target_groups(post, group_filters)
                     if groups:
-                        state_store.queue_delivery(PendingDelivery(post, groups, staging_failed=True))
+                        state_store.queue_delivery(
+                            PendingDelivery(post, groups, staging_failed=True, collected_at=collected_at)
+                        )
                     else:
                         state_store.mark_seen(account, post.post_id)
                     await self._save_state()
@@ -2186,7 +2334,7 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                     state_store.mark_seen(account, post.post_id)
                     continue
                 prepared = await self._prepare_post_translation(media_post)
-                state_store.queue_delivery(PendingDelivery(prepared, groups))
+                state_store.queue_delivery(PendingDelivery(prepared, groups, collected_at=collected_at))
                 # 先保存正文和目标，再上传媒体；重载后即使 RSS 已翻页也能恢复。
                 await self._save_state()
             # 每个账号处理完立即缓存，群发任务可在后续账号扫描期间消费。
@@ -2292,11 +2440,15 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
 
         stream_cache: Dict[str, str] = {}
         forwarder: Optional[QQForwarder] = None
+        subscriptions = self._require_subscription_store()
+        enabled_groups = {group_id for group_id in by_group if subscriptions.is_push_enabled(group_id)}
         staged_cache = {
             key: item.staged for key, (item, _groups) in deliveries.items() if item.staged is not None
         }
         for group_id, items in by_group.items():
             items.sort(key=lambda item: item.post.published_at)
+            if group_id not in enabled_groups:
+                continue
             try:
                 stream_id = await self._resolve_group_stream(group_id, stream_cache)
             except Exception:
@@ -2339,14 +2491,19 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
                 ):
                     failed_posts.append(item.post)
             if self.config.nitter.send_failed_links_forward and failed_posts:
-                await self._send_failed_post_links(failed_posts, group_id, stream_id)
+                await self._send_failed_post_links(failed_posts, stream_id, f"QQ 群 {group_id}")
                 for post in failed_posts:
                     state_store.mark_token_completed(post.account, post.post_id, group_id, FAILED_LINKS_NOTICE_TOKEN)
                 await self._save_state()
 
+        deferred_private = await self._forward_private_subscriptions(by_group, enabled_groups, staged_cache, forwarder)
         for item, groups in deliveries.values():
             post = item.post
-            if all(self._post_group_delivery_completed(post, group) for group in groups):
+            if all(
+                (post.account, post.post_id, group) not in deferred_private
+                and (group not in enabled_groups or self._post_group_delivery_completed(post, group))
+                for group in groups
+            ):
                 dropped = any(
                     DROPPED_FORWARD_TOKEN in state_store.completed_tokens(post.account, post.post_id, group)
                     for group in groups
@@ -2369,18 +2526,219 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         )
         return summary
 
+    async def _forward_private_subscriptions(
+        self,
+        by_group: Dict[str, List[PendingDelivery]],
+        enabled_groups: Set[str],
+        staged_cache: Dict[Tuple[str, str], StagedPost],
+        forwarder: Optional[QQForwarder],
+    ) -> Set[Tuple[str, str, str]]:
+        """同一来源群的已确认聊天记录，或关闭群推送时预先分好的包，分别投递给好友。"""
+
+        deferred: Set[Tuple[str, str, str]] = set()
+        if not self.config.private_subscriptions.enabled:
+            return deferred
+        subscriptions = self._require_private_subscriptions()
+        state = self._require_state_store()
+        friends: Optional[Set[str]] = None
+        friend_lookup_failed = False
+        for group_id, items in by_group.items():
+            users = subscriptions.users(group_id)
+            if not users:
+                continue
+            earliest_subscription = min(users.values())
+            candidates = {
+                (item.post.account, item.post.post_id): item
+                for item in items if item.collected_at >= earliest_subscription
+            }
+            if group_id in enabled_groups:
+                confirmed: Dict[str, List[NitterPost]] = {}
+                for item in candidates.values():
+                    tokens = state.completed_tokens(item.post.account, item.post.post_id, group_id)
+                    receipt = next((token for token in tokens if token.startswith(GROUP_RECEIPT_PREFIX)), None)
+                    if receipt is not None and item.staged is not None:
+                        confirmed.setdefault(receipt, []).append(item.post)
+                batches = list(confirmed.values())
+            else:
+                batches = [
+                    posts async for posts, _ in self._subscription_batches(
+                        [item.post for item in candidates.values() if item.staged is not None], group_id, staged_cache,
+                    )
+                ]
+            batch_keys = {(post.account, post.post_id) for batch in batches for post in batch}
+            source_failed = {
+                key for key, item in candidates.items()
+                if self.config.nitter.send_failed_links_forward and key not in batch_keys and (
+                    item.staging_failed
+                    or DROPPED_FORWARD_TOKEN in state.completed_tokens(*key, group_id)
+                )
+            }
+            if not batches and not source_failed:
+                continue
+            if friends is None and not friend_lookup_failed:
+                try:
+                    if forwarder is None:
+                        forwarder = await QQForwarder.connect(self.ctx, self.config.delivery.qq_account_id)
+                    friends = await forwarder.friend_ids()
+                except Exception:
+                    friend_lookup_failed = True
+                    self.ctx.logger.warning("无法验证私聊推送的 QQ 好友关系，本轮私聊延期", exc_info=True)
+            if friend_lookup_failed:
+                deferred.update((*key, group_id) for key in batch_keys | source_failed)
+                continue
+            assert forwarder is not None and friends is not None
+            recipients = users.keys() & friends
+            if not recipients:
+                continue
+            try:
+                name = await forwarder.group_name(group_id)
+            except Exception:
+                self.ctx.logger.warning("获取私聊推送来源群 %s 的名称失败", group_id, exc_info=True)
+                deferred.update((*key, group_id) for key in batch_keys | source_failed)
+                continue
+            name = name if name.endswith("群") else name + "群"
+            for user_id in sorted(recipients):
+                target = f"private:{group_id}:{user_id}"
+                eligible = {key for key, item in candidates.items() if item.collected_at >= users[user_id]}
+                pending_batches = [
+                    [
+                        post for post in batch
+                        if (post.account, post.post_id) in eligible
+                        and PRIVATE_ATTEMPT_TOKEN not in state.completed_tokens(post.account, post.post_id, target)
+                    ]
+                    for batch in batches
+                ]
+                pending_batches = [batch for batch in pending_batches if batch]
+                failed_posts = []
+                if self.config.nitter.send_failed_links_forward:
+                    for key, item in candidates.items():
+                        if key not in eligible:
+                            continue
+                        tokens = state.completed_tokens(*key, target)
+                        if FAILED_LINKS_NOTICE_TOKEN not in tokens and (
+                            key in source_failed or PRIVATE_INCOMPLETE_TOKEN in tokens
+                        ):
+                            failed_posts.append(item.post)
+                if (not pending_batches and not failed_posts) or not self.config.private_subscriptions.enabled:
+                    continue
+                if subscriptions.users(group_id).get(user_id) != users[user_id]:
+                    continue
+                if not await self._send_private_subscription_batches(
+                    group_id, name, user_id, users[user_id], forwarder.self_id, pending_batches, staged_cache,
+                    failed_posts,
+                ):
+                    deferred.update(
+                        (post.account, post.post_id, group_id) for batch in pending_batches for post in batch
+                    )
+                    deferred.update((post.account, post.post_id, group_id) for post in failed_posts)
+        return deferred
+
+    async def _send_private_subscription_batches(
+        self,
+        group_id: str,
+        group_name: str,
+        user_id: str,
+        subscribed_at: float,
+        account_id: str,
+        batches: List[List[NitterPost]],
+        staged_cache: Dict[Tuple[str, str], StagedPost],
+        failed_posts: List[NitterPost],
+    ) -> bool:
+        """发送来源提示和聊天记录。仅在还没提交聊天记录时允许下轮继续。"""
+
+        subscriptions = self._require_private_subscriptions()
+        try:
+            session = await self.ctx.chat.open_session(
+                platform="qq", chat_type="private", user_id=user_id, account_id=account_id,
+            )
+            if not isinstance(session, dict) or not session.get("success") or not session.get("stream_id"):
+                raise RuntimeError(f"无法打开 QQ 私聊: {session}")
+            stream_id = session["stream_id"]
+        except Exception:
+            self.ctx.logger.warning("无法打开订阅者 %s 的 QQ 私聊", user_id, exc_info=True)
+            return False
+
+        cache = self._require_media_cache()
+        state = self._require_state_store()
+        target = f"private:{group_id}:{user_id}"
+        header_sent = False
+        # 只有失败链接时也发一次来源提示。
+        for posts in batches or [[]]:
+            if not self.config.private_subscriptions.enabled or subscriptions.users(group_id).get(user_id) != subscribed_at:
+                return True
+            staged = [staged_cache[(post.account, post.post_id)] for post in posts]
+            outgoing = []
+            try:
+                for post, media in zip(posts, staged, strict=True):
+                    outgoing.extend(await asyncio.to_thread(cache.sdk_nodes, post, media, self._format_post_text(post)))
+            except (OSError, ValueError):
+                self.ctx.logger.error("组装来源群 %s 的私聊推送失败", group_id, exc_info=True)
+                return False
+            if not header_sent:
+                try:
+                    header_sent, _ = self._read_send_result(
+                        await self.ctx.send.text(f"来自{group_name}的推特订阅推送", stream_id)
+                    )
+                except Exception:
+                    self.ctx.logger.warning("发送来源群 %s 的私聊推送提示失败", group_id, exc_info=True)
+                    return False
+                if not header_sent:
+                    self.ctx.logger.warning("未确认向订阅者 %s 发送来源群 %s 的提示", user_id, group_id)
+                    return False
+            if not posts:
+                break
+            if not self.config.private_subscriptions.enabled or subscriptions.users(group_id).get(user_id) != subscribed_at:
+                return True
+            # 先记录提交意图。发送超时或进程中断后没有可靠回执，避免重载后重复提交。
+            for post in posts:
+                state.mark_token_completed(post.account, post.post_id, target, PRIVATE_ATTEMPT_TOKEN)
+            await self._save_state()
+            sent = False
+            try:
+                sent = await self._send_forward_nodes(
+                    outgoing, stream_id, context_posts=posts, context_staged=staged, cache=cache,
+                )
+            except Exception:
+                self.ctx.logger.warning("向订阅者 %s 发送来源群 %s 的聊天记录结果未知", user_id, group_id, exc_info=True)
+            else:
+                if not sent:
+                    self.ctx.logger.warning("未确认向订阅者 %s 发送来源群 %s 的聊天记录", user_id, group_id)
+            incomplete = [post for post, media in zip(posts, staged, strict=True) if not sent or media.failed_media_tokens]
+            if incomplete:
+                for post in incomplete:
+                    state.mark_token_completed(post.account, post.post_id, target, PRIVATE_INCOMPLETE_TOKEN)
+                failed_posts.extend(incomplete)
+                await self._save_state()
+        if (
+            failed_posts
+            and self.config.nitter.send_failed_links_forward
+            and self.config.private_subscriptions.enabled
+            and subscriptions.users(group_id).get(user_id) == subscribed_at
+        ):
+            for post in failed_posts:
+                state.mark_token_completed(post.account, post.post_id, target, FAILED_LINKS_NOTICE_TOKEN)
+            await self._save_state()
+            await self._send_failed_post_links(
+                failed_posts, stream_id, f"QQ 私聊 {user_id}（来源群 {group_id}）", private=True,
+            )
+        return True
+
     async def _send_failed_post_links(
         self,
         posts: List[NitterPost],
-        group_id: str,
         stream_id: str,
+        target: str,
+        *,
+        private: bool = False,
     ) -> None:
-        """把本轮同群的失败原文链接去重后一次合并发送，不递归重试提示本身。"""
+        """把本轮失败原文链接去重后一次合并发送，不递归重试提示本身。"""
 
         links = list(dict.fromkeys(self._post_source_url(post) for post in posts))
         if not links:
             return
         notice = "此次转发中，以下推文或其附件未能完整发送，请自行打开原文查验。"
+        if private:
+            notice = "以下推文或附件未能完整发送，或尚未确认送达。可以打开原文查看。"
         nodes: List[Dict[str, Any]] = [
             {
                 "user_id": "0",
@@ -2409,22 +2767,22 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
             )
         except Exception:
             self.ctx.logger.error(
-                "向 QQ 群 %s 发送 %d 条失败推文链接汇总时出现异常，不再重试提示",
-                group_id,
+                "向 %s 发送 %d 条失败推文链接汇总时出现异常，不再重试提示",
+                target,
                 len(links),
                 exc_info=True,
             )
             return
         if not sent:
             self.ctx.logger.error(
-                "向 QQ 群 %s 发送 %d 条失败推文链接汇总失败，不再重试提示",
-                group_id,
+                "向 %s 发送 %d 条失败推文链接汇总失败，不再重试提示",
+                target,
                 len(links),
             )
         else:
             self.ctx.logger.info(
-                "已向 QQ 群 %s 合并发送本轮 %d 条失败推文的原文链接",
-                group_id,
+                "已向 %s 合并发送本轮 %d 条失败推文的原文链接",
+                target,
                 len(links),
             )
 
@@ -2964,6 +3322,42 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         if changed:
             self.ctx.logger.info("NitterToMaiBot 后台订阅列表已同步")
 
+    async def _sync_private_subscription_mirror(self) -> None:
+        store = self._require_private_subscriptions()
+        rows = [{"group_id": group_id, "user_id": user_id} for group_id, user_id in sorted(store.memberships())]
+        await asyncio.to_thread(self._config_mirror.sync_private, rows, store.revision())
+
+    async def _apply_private_subscription_config_update(self) -> None:
+        """按私聊管理方式保存后台修改，拒绝过期页面覆盖最新关系。"""
+
+        config = self.config.private_subscriptions
+        store = self._require_private_subscriptions()
+        current = store.memberships()
+        desired = {(row.group_id, row.user_id) for row in config.records}
+        if desired == current:
+            await self._sync_private_subscription_mirror()
+            return
+        if config.management_mode == "仅群命令" or config.revision != store.revision():
+            reason = "当前为仅群命令模式" if config.management_mode == "仅群命令" else "后台页面版本已过期"
+            self.ctx.logger.warning("%s，已拒绝并还原后台私聊订阅列表修改", reason)
+            await self._sync_private_subscription_mirror()
+            return
+        try:
+            additions = desired - current
+            if additions:
+                groups = self._require_subscription_store()
+                missing_groups = sorted({group_id for group_id, _ in additions if not groups.subscriptions_for_group(group_id)})
+                if missing_groups:
+                    raise ValueError(f"以下来源群没有推特订阅：{'、'.join(missing_groups)}")
+                forwarder = await QQForwarder.connect(self.ctx, self.config.delivery.qq_account_id)
+                friends = await forwarder.friend_ids()
+                nonfriends = sorted({user_id for _, user_id in additions if user_id not in friends})
+                if nonfriends:
+                    raise ValueError(f"以下用户不是发送机器人的 QQ 好友：{'、'.join(nonfriends)}")
+            await asyncio.to_thread(store.replace_memberships, desired)
+        finally:
+            await self._sync_private_subscription_mirror()
+
     def _subscription_config_snapshot(self) -> Dict[str, object]:
         """把后台配置模型转换为订阅存储可校验的完整快照。"""
 
@@ -3099,6 +3493,11 @@ class NitterToMaiBotPlugin(MaiBotPlugin):
         if self._subscription_store is None:
             raise RuntimeError("NitterToMaiBot 订阅存储尚未初始化")
         return self._subscription_store
+
+    def _require_private_subscriptions(self) -> PrivateSubscriptions:
+        if self._private_subscriptions is None:
+            raise RuntimeError("私聊订阅存储尚未初始化")
+        return self._private_subscriptions
 
 
 def create_plugin() -> NitterToMaiBotPlugin:

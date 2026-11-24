@@ -1,7 +1,7 @@
 """QQ 群订阅关系的持久化存储。"""
 
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 import json
 import os
@@ -214,8 +214,10 @@ class SubscriptionStore:
                 targets[self._account_name(account_entry)] = enabled_groups
         return targets
 
-    def target_subscriptions_by_account(self) -> Dict[str, Dict[str, bool]]:
-        """按账号汇总已启用目标群及对应的仅媒体标记。"""
+    def target_subscriptions_by_account(
+        self, private_source_groups: Optional[Set[str]] = None,
+    ) -> Dict[str, Dict[str, bool]]:
+        """按账号汇总可投递的来源群及对应的仅媒体标记。"""
 
         targets: Dict[str, Dict[str, bool]] = {}
         for account_entry in self._accounts.values():
@@ -223,7 +225,7 @@ class SubscriptionStore:
             enabled_groups = {
                 group_id: self.is_media_only(group_id, account)
                 for group_id in self._groups_from_account(account_entry)
-                if self._groups[group_id]
+                if self._groups[group_id] or (private_source_groups is not None and group_id in private_source_groups)
             }
             if enabled_groups:
                 targets[account] = enabled_groups

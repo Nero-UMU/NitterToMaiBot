@@ -85,6 +85,28 @@ class SubscriptionConfigMirror:
         self._atomic_write(document, original_content)
         return True
 
+    def sync_private(self, records: List[Dict[str, str]], revision: str) -> bool:
+        """同步后台可见的私聊关系，同时保留管理员设置的开关和管理方式。"""
+
+        for attempt in range(3):
+            original = self.config_path.read_bytes()
+            document = tomlkit.parse(original.decode("utf-8"))
+            section = document.unwrap().get("private_subscriptions", {})
+            if section.get("records") == records and section.get("revision") == revision:
+                return False
+            if "private_subscriptions" not in document:
+                document["private_subscriptions"] = tomlkit.table()
+            document["private_subscriptions"]["revision"] = revision
+            document["private_subscriptions"]["records"] = records
+            try:
+                self._atomic_write(document, original)
+            except _ConfigMirrorConflictError:
+                if attempt == 2:
+                    raise
+            else:
+                return True
+        raise AssertionError("私聊订阅快照重试流程异常")
+
     @staticmethod
     def _snapshot_groups(snapshot: Dict[str, object]) -> List[Dict[str, object]]:
         raw_groups = snapshot.get("groups")
